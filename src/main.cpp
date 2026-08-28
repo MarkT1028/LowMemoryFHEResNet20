@@ -214,7 +214,7 @@ void executeResNet64() {
     }
 
     if (input_filename.empty()) {
-        input_filename = "../imgs/cat_64x64.png";
+        input_filename = "../inputs/cat_64x64.png";
         if (verbose >= 0) {
             cout << "You did not set any input, I use " << GREEN_TEXT
                  << input_filename << RESET_COLOR << "." << endl;

@@ -74,7 +74,7 @@ larger spatial grid:
 - all ciphertexts use at most 16384 logical CKKS slots, so the ring dimension
   remains `2^16`.
 
-The included test image is `imgs/cat_64x64.png`. Image dimensions are checked
+The included test image is `inputs/cat_64x64.png`. Image dimensions are checked
 strictly: the 64x64 path rejects any image that is not exactly 64x64. The model
 weights are still the CIFAR-10 weights trained on 32x32 inputs, so timing and
 memory comparisons are meaningful, but classification accuracy at 64x64 must
@@ -95,7 +95,7 @@ Run the bundled 64x64 image:
 
 ```bash
 /usr/bin/time -v ./LowMemoryFHEResNet20 load_keys 3 resolution 64 \
-  input "imgs/cat_64x64.png" verbose 1
+  input "inputs/cat_64x64.png" verbose 1
 ```
 
 `resolution 64` is the default on this branch. The upstream 32x32 path remains
