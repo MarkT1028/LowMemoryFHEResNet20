@@ -80,3 +80,6 @@ build_debug
 ehthumbs.db
 Thumbs.db
 .DS_Store
+
+# Local experiment logs
+logs/
