@@ -60,12 +60,50 @@ The idea is to use $b$, which, without the secret key $s$ would look like a rand
 
 ## How to run
 
-### Native 64x64 branch
+### Native 128x128 branch
 
-This branch adds a native `64x64` inference path while preserving the original
-`32x32` implementation. It does not resize a 64x64 image back to CIFAR-10
-resolution. Instead, it evaluates the same trained ResNet20 weights over the
-larger spatial grid:
+This branch adds native `128x128` and `64x64` inference paths while preserving
+the original `32x32` implementation. A larger input is not resized back to
+CIFAR-10 resolution. For 128x128, the ciphertext layout is:
+
+- input: `3 x 128 x 128` in three ciphertexts, one channel per ciphertext;
+- stage 1: `16 x 128 x 128` in sixteen ciphertexts;
+- stage 2: `32 x 64 x 64` in eight ciphertexts;
+- stage 3: `64 x 32 x 32` in four ciphertexts;
+- all ciphertexts use at most 16384 logical CKKS slots, so the ring dimension
+  remains `2^16`.
+
+The included test image is `inputs/dog_128x128.png`. Dimensions are checked
+strictly. Generate the independent 128x128 Experiment 3 key set from `build`:
+
+```bash
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  generate_keys 3 resolution 128 verbose 1 \
+  2>&1 | tee ../logs/keygen_exp3_128.log
+```
+
+This writes `keys_exp3_128`; it does not modify `keys_exp3` or `keys_exp3_64`.
+Run the bundled dog image with:
+
+```bash
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 128 \
+  input "inputs/dog_128x128.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_128.log
+```
+
+The CIFAR-10 label for dog is index `5`. The included network was trained on
+32x32 CIFAR-10 images, however, so a dog prediction at 128x128 is an experiment,
+not a guaranteed correctness check. A real accuracy comparison requires a
+labelled test set evaluated consistently at every resolution.
+
+`resolution 128` is the default on this branch. The 128x128 path uses
+substantially more ciphertexts than 64x64, so allow considerably more RAM and
+runtime. Key generation is also disk-intensive.
+
+### Native 64x64 path
+
+The previous 64x64 layout remains available:
 
 - input: `3 x 64 x 64`, padded to four channel blocks in one ciphertext;
 - stage 1: `16 x 64 x 64` in four ciphertexts;
@@ -98,8 +136,7 @@ Run the bundled 64x64 image:
   input "inputs/cat_64x64.png" verbose 1
 ```
 
-`resolution 64` is the default on this branch. The upstream 32x32 path remains
-available explicitly:
+The upstream 32x32 path also remains available explicitly:
 
 ```bash
 ./LowMemoryFHEResNet20 load_keys 3 resolution 32 input "inputs/luis.png"
@@ -155,36 +192,36 @@ and run it with the following command:
 
 - `generate_keys`, type `int`, a value in `[1, 2, 3, 4]`
 - `load_keys`, type: `int` a value in `[1, 2, 3, 4]`
-- `input`, type: `string`, the filename of a custom image. It **MUST** match the selected resolution exactly (`32x32` or `64x64`) and may be `.jpg` or `.png`; inputs are decoded as RGB
+- `input`, type: `string`, the filename of a custom image. It **MUST** match the selected resolution exactly (`32x32`, `64x64`, or `128x128`) and may be `.jpg` or `.png`; inputs are decoded as RGB
 - `verbose` a value in `[-1, 0, 1, 2]`, the first shows no information, the last shows a lot of messages
 - `plain`: added when the user wants the plain result too. This comparison is currently available only for the original 32x32 path. It requires `torch`, `torchvision`, `PIL`, and `numpy`.
-- `resolution`, type: `int`, either `32` or `64`; this branch defaults to `64`
+- `resolution`, type: `int`, either `32`, `64`, or `128`; this branch defaults to `128`
 
 #### Some examples 
 
-The first execution should be launched with the `generate_keys` argument, using the preferred set of parameters. Check the paper to see the differences between them. For instance, we choose the set of parameters defined in the first experiment:
+The first execution should be launched with the `generate_keys` argument, using the preferred set of parameters. Check the paper to see the differences between them. The original 32x32 example is selected explicitly below:
 ```
-./LowMemoryFHEResNet20 generate_keys 1
+./LowMemoryFHEResNet20 generate_keys 1 resolution 32
 ```
 This command create the required keys and stores them in a new folder called `keys_exp1`, in the root folder of the project.
 
-The default command creates a new context and classifies the default image in `inputs/luis.png`. We can, however, use custom arguments.
+The 32x32 path classifies the default image in `inputs/luis.png`. We can, however, use custom arguments.
 We can use a set of serialized context and keys with the argument `load_keys` as follows:
 
 ```
-./LowMemoryFHEResNet20 load_keys 1
+./LowMemoryFHEResNet20 load_keys 1 resolution 32
 ```
 This command loads context and keys from the folder `keys_exp1`, located in the root folder of the project, and runs an inference on the default image.
 Then, in order to load a custom image, we use the argument `input` as follows:
 
 ```
-./LowMemoryFHEResNet20 load_keys 1 input "inputs/vale.jpg"
+./LowMemoryFHEResNet20 load_keys 1 resolution 32 input "inputs/vale.jpg"
 ```
 Even for this argument, the starting position will be the root of the project.
 We can also compare the result with the plain version of the model, using the `plain` keyword:
 
 ```
-./LowMemoryFHEResNet20 load_keys 1 input "inputs/vale.jpg" plain
+./LowMemoryFHEResNet20 load_keys 1 resolution 32 input "inputs/vale.jpg" plain
 ```
 
 This command will launch a Python script at the end of the encrypted comptations, giving the plain output (which will differ from the encrypted one according to the parameters, check the paper for the precision values of each set of parameters).

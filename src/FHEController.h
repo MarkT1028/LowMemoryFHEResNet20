@@ -157,7 +157,7 @@ public:
                                    double scale = 0.5,
                                    bool stride2_output = false,
                                    bool timing = false);
-    EncryptedTensor downsample_stride2_sharded(const EncryptedTensor& in,
+    EncryptedTensor downsample_stride2_sharded(EncryptedTensor in,
                                                int output_channels_per_ciphertext,
                                                bool timing = false);
     EncryptedTensor bootstrap_tensor(const EncryptedTensor& in, bool timing = false);

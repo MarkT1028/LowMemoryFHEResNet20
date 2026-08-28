@@ -114,15 +114,26 @@ namespace utils {
         return values;
     }
 
-    static inline vector<double> read_fc_weight (const string& filename, int channel_block_size = 64) {
+    static inline vector<double> read_fc_weight_range(const string& filename,
+                                                      int first_channel,
+                                                      int channel_count,
+                                                      int channel_block_size) {
+        if (first_channel < 0 || channel_count <= 0 ||
+            first_channel + channel_count > 64) {
+            throw invalid_argument("Invalid fully-connected channel range");
+        }
         if (channel_block_size < 10) {
             throw invalid_argument("The fully-connected channel block must contain at least 10 class slots");
         }
 
         vector<double> weight = read_values_from_file(filename);
+        if (weight.size() < 640) {
+            throw runtime_error("The fully-connected weight file is truncated: " + filename);
+        }
         vector<double> weight_corrected;
+        weight_corrected.reserve(channel_count * channel_block_size);
 
-        for (int i = 0; i < 64; i++) {
+        for (int i = first_channel; i < first_channel + channel_count; i++) {
             for (int j = 0; j < 10; j++) {
                 weight_corrected.push_back(weight[(10 * i) + j]);
             }
@@ -132,6 +143,11 @@ namespace utils {
         }
 
         return weight_corrected;
+    }
+
+    static inline vector<double> read_fc_weight(const string& filename,
+                                                int channel_block_size = 64) {
+        return read_fc_weight_range(filename, 0, 64, channel_block_size);
     }
 
     static inline double compute_approx_error(Plaintext expected, Plaintext bootstrapped) {

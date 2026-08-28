@@ -1574,7 +1574,12 @@ EncryptedTensor FHEController::convbn_sharded(const EncryptedTensor& in,
                 pair_result = pair_result
                     ? context->EvalAdd(pair_result, diagonal_sum)
                     : diagonal_sum;
-                pair_result = context->EvalRotate(pair_result, -in.layout.area());
+                // For one channel per ciphertext the full-block rotation is an
+                // identity rotation. OpenFHE does not need (or serialize) a
+                // rotation key for +/- the complete logical slot count.
+                if (group_channels > 1) {
+                    pair_result = context->EvalRotate(pair_result, -in.layout.area());
+                }
             }
 
             result.shards[output_shard] = result.shards[output_shard]
@@ -1632,7 +1637,7 @@ Ptxt FHEController::channel_compaction_mask(int width,
 }
 
 EncryptedTensor FHEController::downsample_stride2_sharded(
-    const EncryptedTensor& in,
+    EncryptedTensor in,
     int output_channels_per_ciphertext,
     bool timing) {
     auto start = start_time();
@@ -1652,9 +1657,19 @@ EncryptedTensor FHEController::downsample_stride2_sharded(
         throw invalid_argument("Stride-2 output must fill one ciphertext exactly");
     }
 
-    vector<Ctxt> compacted;
-    compacted.reserve(in.shards.size());
-    for (const Ctxt& shard : in.shards) {
+    EncryptedTensor result;
+    result.layout = TensorLayout{
+        compact_width,
+        in.layout.channels,
+        output_channels_per_ciphertext,
+        in.layout.slots,
+    };
+    result.shards.resize(result.layout.ciphertext_count());
+
+    for (int source_shard = 0;
+         source_shard < static_cast<int>(in.shards.size());
+         source_shard++) {
+        Ctxt shard = std::move(in.shards[source_shard]);
         Ctxt horizontal = shard->Clone();
         for (int step = 1; step < compact_width; step *= 2) {
             horizontal = context->EvalAdd(horizontal, context->EvalRotate(horizontal, step));
@@ -1679,37 +1694,29 @@ EncryptedTensor FHEController::downsample_stride2_sharded(
         }
 
         Ctxt compacted_channels;
-        for (int channel = 0; channel < input_group; channel++) {
-            Ctxt masked = context->EvalMult(
-                compacted_rows,
-                channel_compaction_mask(
-                    width, input_group, channel, compacted_rows->GetLevel()));
-            compacted_channels = compacted_channels
-                ? context->EvalAdd(compacted_channels, masked)
-                : masked;
+        if (input_group == 1) {
+            // Row compaction already occupies exactly the first compact area.
+            // Avoid an unnecessary plaintext multiplication and two rotations
+            // in the 128x128 first transition.
+            compacted_channels = compacted_rows;
+        } else {
+            for (int channel = 0; channel < input_group; channel++) {
+                Ctxt masked = context->EvalMult(
+                    compacted_rows,
+                    channel_compaction_mask(
+                        width, input_group, channel, compacted_rows->GetLevel()));
+                compacted_channels = compacted_channels
+                    ? context->EvalAdd(compacted_channels, masked)
+                    : masked;
+                compacted_channels = context->EvalRotate(
+                    compacted_channels, -(area - compact_area));
+            }
             compacted_channels = context->EvalRotate(
-                compacted_channels, -(area - compact_area));
+                compacted_channels, (area - compact_area) * input_group);
         }
-        compacted_channels = context->EvalRotate(
-            compacted_channels, (area - compact_area) * input_group);
-        compacted.push_back(compacted_channels);
-    }
-
-    EncryptedTensor result;
-    result.layout = TensorLayout{
-        compact_width,
-        in.layout.channels,
-        output_channels_per_ciphertext,
-        in.layout.slots,
-    };
-    result.shards.resize(result.layout.ciphertext_count());
-
-    for (int source_shard = 0;
-         source_shard < static_cast<int>(compacted.size());
-         source_shard++) {
         int target_shard = source_shard / merge_factor;
         int position = source_shard % merge_factor;
-        Ctxt shifted = compacted[source_shard];
+        Ctxt shifted = compacted_channels;
         for (int shift = 0; shift < position; shift++) {
             shifted = context->EvalRotate(shifted, -compact_chunk_slots);
         }
