@@ -64,6 +64,10 @@ keys_exp1
 keys_exp2
 keys_exp3
 keys_exp4
+keys_exp1_64
+keys_exp2_64
+keys_exp3_64
+keys_exp4_64
 
 checkpoints
 build
@@ -83,3 +87,4 @@ Thumbs.db
 
 # Local experiment logs
 logs/
+__pycache__/

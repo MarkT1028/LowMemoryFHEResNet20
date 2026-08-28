@@ -518,18 +518,6 @@ Ctxt FHEController::bootstrap(const Ctxt &c, int precision, bool timing) {
 Ctxt FHEController::relu(const Ctxt &c, double scale, bool timing) {
     auto start = start_time();
 
-    /*
-     * Max min
-     */
-    Ptxt result;
-    context->Decrypt(key_pair.secretKey, c, &result);
-    vector<double> v = result->GetRealPackedValue();
-
-    //cout << "min: " << *min_element(v.begin(), v.end()) << ", max: " << *max_element(v.begin(), v.end()) << endl;
-    /*
-     * Max min
-     */
-
     Ctxt res = context->EvalChebyshevFunction([scale](double x) -> double { if (x < 0) return 0; else return (1 / scale) * x; }, c,
                                               -1,
                                               1, relu_degree);
@@ -1295,8 +1283,500 @@ Ctxt FHEController::rotsum_padded(const Ctxt &in, int slots) {
     return result;
 }
 
+Ctxt FHEController::rotsum_padded_blocks(const Ctxt& in,
+                                         int block_size,
+                                         int blocks) {
+    if (block_size <= 0 || blocks <= 0 || (blocks & (blocks - 1)) != 0) {
+        throw invalid_argument("The padded rotation sum requires a power-of-two block count");
+    }
+
+    Ctxt result = in->Clone();
+    for (int stride = 1; stride < blocks; stride *= 2) {
+        result = add(result, context->EvalRotate(result, block_size * stride));
+    }
+    return result;
+}
+
 Ctxt FHEController::repeat(const Ctxt &in, int slots) {
     return context->EvalRotate(rotsum(in, slots), -slots + 1);
+}
+
+FusedConvWeights FHEController::load_fused_conv_weights(const string& filename) const {
+    ifstream input(filename, ios::in | ios::binary);
+    if (!input.is_open()) {
+        throw runtime_error("Cannot open compact fused weights: " + filename);
+    }
+
+    char magic[8];
+    input.read(magic, sizeof(magic));
+    if (!input || string(magic, sizeof(magic)) != "FHEWGHT1") {
+        throw runtime_error("Invalid compact fused weight header: " + filename);
+    }
+
+    uint32_t out_channels = 0;
+    uint32_t in_channels = 0;
+    uint32_t kernel_size = 0;
+    input.read(reinterpret_cast<char*>(&out_channels), sizeof(out_channels));
+    input.read(reinterpret_cast<char*>(&in_channels), sizeof(in_channels));
+    input.read(reinterpret_cast<char*>(&kernel_size), sizeof(kernel_size));
+
+    if (!input || out_channels == 0 || in_channels == 0 ||
+        (kernel_size != 1 && kernel_size != 3)) {
+        throw runtime_error("Invalid compact fused weight dimensions: " + filename);
+    }
+
+    FusedConvWeights result;
+    result.out_channels = static_cast<int>(out_channels);
+    result.in_channels = static_cast<int>(in_channels);
+    result.kernel_size = static_cast<int>(kernel_size);
+
+    size_t weight_count = static_cast<size_t>(out_channels) * in_channels *
+                          kernel_size * kernel_size;
+    result.weights.resize(weight_count);
+    result.bias.resize(out_channels);
+    input.read(reinterpret_cast<char*>(result.weights.data()),
+               static_cast<streamsize>(weight_count * sizeof(double)));
+    input.read(reinterpret_cast<char*>(result.bias.data()),
+               static_cast<streamsize>(out_channels * sizeof(double)));
+
+    if (!input) {
+        throw runtime_error("Truncated compact fused weight file: " + filename);
+    }
+
+    return result;
+}
+
+EncryptedTensor FHEController::encrypt_tensor(const vector<double>& values,
+                                              const TensorLayout& layout,
+                                              int level) {
+    if (layout.width <= 0 || layout.channels <= 0 ||
+        layout.channels_per_ciphertext <= 0 ||
+        layout.slots != layout.channels_per_ciphertext * layout.area()) {
+        throw invalid_argument("Invalid encrypted tensor layout");
+    }
+    if (layout.slots > num_slots) {
+        throw invalid_argument("Tensor shard exceeds the configured CKKS slot capacity");
+    }
+    if (values.size() != static_cast<size_t>(layout.channels * layout.area())) {
+        throw invalid_argument("Input tensor element count does not match its layout");
+    }
+
+    EncryptedTensor result;
+    result.layout = layout;
+    result.shards.reserve(layout.ciphertext_count());
+
+    for (int shard = 0; shard < layout.ciphertext_count(); shard++) {
+        vector<double> packed(layout.slots, 0.0);
+        for (int local_channel = 0;
+             local_channel < layout.channels_per_ciphertext;
+             local_channel++) {
+            int global_channel = shard * layout.channels_per_ciphertext + local_channel;
+            if (global_channel >= layout.channels) {
+                break;
+            }
+            auto source_begin = values.begin() + global_channel * layout.area();
+            copy(source_begin,
+                 source_begin + layout.area(),
+                 packed.begin() + local_channel * layout.area());
+        }
+        result.shards.push_back(encrypt(packed, level, layout.slots));
+    }
+
+    return result;
+}
+
+vector<Ctxt> FHEController::spatial_rotations(const Ctxt& in,
+                                              int width,
+                                              int kernel_size) {
+    if (kernel_size == 1) {
+        return {in};
+    }
+    if (kernel_size != 3) {
+        throw invalid_argument("Only 1x1 and 3x3 convolutions are supported");
+    }
+
+    vector<Ctxt> rotations;
+    rotations.reserve(9);
+    auto digits = context->EvalFastRotationPrecompute(in);
+
+    rotations.push_back(
+        context->EvalRotate(
+            context->EvalFastRotation(in, -1, context->GetCyclotomicOrder(), digits),
+            -width));
+    rotations.push_back(
+        context->EvalFastRotation(in, -width, context->GetCyclotomicOrder(), digits));
+    rotations.push_back(
+        context->EvalRotate(
+            context->EvalFastRotation(in, 1, context->GetCyclotomicOrder(), digits),
+            -width));
+    rotations.push_back(
+        context->EvalFastRotation(in, -1, context->GetCyclotomicOrder(), digits));
+    rotations.push_back(in);
+    rotations.push_back(
+        context->EvalFastRotation(in, 1, context->GetCyclotomicOrder(), digits));
+    rotations.push_back(
+        context->EvalRotate(
+            context->EvalFastRotation(in, -1, context->GetCyclotomicOrder(), digits),
+            width));
+    rotations.push_back(
+        context->EvalFastRotation(in, width, context->GetCyclotomicOrder(), digits));
+    rotations.push_back(
+        context->EvalRotate(
+            context->EvalFastRotation(in, 1, context->GetCyclotomicOrder(), digits),
+            width));
+
+    return rotations;
+}
+
+Ptxt FHEController::sharded_conv_diagonal(const FusedConvWeights& weights,
+                                           const TensorLayout& input_layout,
+                                           int input_shard,
+                                           int output_shard,
+                                           int output_channels,
+                                           int diagonal,
+                                           int kernel_index,
+                                           int level,
+                                           double scale,
+                                           bool stride2_output) {
+    int width = input_layout.width;
+    int area = input_layout.area();
+    int group_channels = input_layout.channels_per_ciphertext;
+    vector<double> encoded(input_layout.slots, 0.0);
+
+    int row_offset = 0;
+    int column_offset = 0;
+    if (weights.kernel_size == 3) {
+        row_offset = kernel_index / 3 - 1;
+        column_offset = kernel_index % 3 - 1;
+    }
+
+    for (int input_local = 0; input_local < group_channels; input_local++) {
+        int output_local = (input_local - diagonal + group_channels) % group_channels;
+        int input_channel = input_shard * group_channels + input_local;
+        int output_channel = output_shard * group_channels + output_local;
+        if (input_channel >= weights.in_channels ||
+            output_channel >= output_channels ||
+            output_channel >= weights.out_channels) {
+            continue;
+        }
+
+        double coefficient = weights.at(output_channel, input_channel, kernel_index) * scale;
+        int block_start = input_local * area;
+        for (int row = 0; row < width; row++) {
+            for (int column = 0; column < width; column++) {
+                if (stride2_output && ((row & 1) != 0 || (column & 1) != 0)) {
+                    continue;
+                }
+                int input_row = row + row_offset;
+                int input_column = column + column_offset;
+                if (input_row < 0 || input_row >= width ||
+                    input_column < 0 || input_column >= width) {
+                    continue;
+                }
+                encoded[block_start + row * width + column] = coefficient;
+            }
+        }
+    }
+
+    return encode(encoded, level, input_layout.slots);
+}
+
+Ptxt FHEController::sharded_bias(const FusedConvWeights& weights,
+                                 const TensorLayout& output_layout,
+                                 int output_shard,
+                                 int level,
+                                 double scale,
+                                 bool stride2_output) {
+    vector<double> encoded(output_layout.slots, 0.0);
+    int area = output_layout.area();
+    for (int local_channel = 0;
+         local_channel < output_layout.channels_per_ciphertext;
+         local_channel++) {
+        int output_channel = output_shard * output_layout.channels_per_ciphertext + local_channel;
+        if (output_channel >= output_layout.channels ||
+            output_channel >= weights.out_channels) {
+            continue;
+        }
+        double value = weights.bias[output_channel] * scale;
+        int block_start = local_channel * area;
+        for (int row = 0; row < output_layout.width; row++) {
+            for (int column = 0; column < output_layout.width; column++) {
+                if (stride2_output && ((row & 1) != 0 || (column & 1) != 0)) {
+                    continue;
+                }
+                encoded[block_start + row * output_layout.width + column] = value;
+            }
+        }
+    }
+    return encode(encoded, level, output_layout.slots);
+}
+
+EncryptedTensor FHEController::convbn_sharded(const EncryptedTensor& in,
+                                              const string& compact_weight_file,
+                                              int output_channels,
+                                              double scale,
+                                              bool stride2_output,
+                                              bool timing) {
+    auto start = start_time();
+    FusedConvWeights weights = load_fused_conv_weights(compact_weight_file);
+    if (weights.in_channels != in.layout.channels ||
+        weights.out_channels != output_channels) {
+        throw invalid_argument("Compact convolution dimensions do not match the encrypted tensor");
+    }
+
+    TensorLayout output_layout{
+        in.layout.width,
+        output_channels,
+        in.layout.channels_per_ciphertext,
+        in.layout.slots,
+    };
+    EncryptedTensor result;
+    result.layout = output_layout;
+    result.shards.resize(output_layout.ciphertext_count());
+
+    int group_channels = in.layout.channels_per_ciphertext;
+    int kernel_elements = weights.kernel_size * weights.kernel_size;
+
+    for (int input_shard = 0;
+         input_shard < static_cast<int>(in.shards.size());
+         input_shard++) {
+        vector<Ctxt> rotations = spatial_rotations(
+            in.shards[input_shard], in.layout.width, weights.kernel_size);
+
+        for (int output_shard = 0;
+             output_shard < output_layout.ciphertext_count();
+             output_shard++) {
+            Ctxt pair_result;
+            for (int diagonal = 0; diagonal < group_channels; diagonal++) {
+                vector<Ctxt> kernel_terms;
+                kernel_terms.reserve(kernel_elements);
+                for (int kernel_index = 0;
+                     kernel_index < kernel_elements;
+                     kernel_index++) {
+                    Ptxt diagonal_weights = sharded_conv_diagonal(
+                        weights,
+                        in.layout,
+                        input_shard,
+                        output_shard,
+                        output_channels,
+                        diagonal,
+                        kernel_index,
+                        in.shards[input_shard]->GetLevel(),
+                        scale,
+                        stride2_output);
+                    kernel_terms.push_back(
+                        context->EvalMult(rotations[kernel_index], diagonal_weights));
+                }
+
+                Ctxt diagonal_sum = kernel_terms.size() == 1
+                    ? kernel_terms[0]
+                    : context->EvalAddMany(kernel_terms);
+                pair_result = pair_result
+                    ? context->EvalAdd(pair_result, diagonal_sum)
+                    : diagonal_sum;
+                pair_result = context->EvalRotate(pair_result, -in.layout.area());
+            }
+
+            result.shards[output_shard] = result.shards[output_shard]
+                ? context->EvalAdd(result.shards[output_shard], pair_result)
+                : pair_result;
+        }
+    }
+
+    for (int output_shard = 0;
+         output_shard < output_layout.ciphertext_count();
+         output_shard++) {
+        Ptxt bias = sharded_bias(
+            weights,
+            output_layout,
+            output_shard,
+            result.shards[output_shard]->GetLevel(),
+            scale,
+            stride2_output);
+        result.shards[output_shard] = context->EvalAdd(result.shards[output_shard], bias);
+    }
+
+    if (timing) {
+        print_duration(start,
+                       "Sharded Conv+BN " + to_string(in.layout.channels) + "->" +
+                       to_string(output_channels) + " at " +
+                       to_string(in.layout.width) + "x" + to_string(in.layout.width));
+    }
+    return result;
+}
+
+Ptxt FHEController::row_compaction_mask(int width,
+                                        int channels_per_ciphertext,
+                                        int row,
+                                        int level) {
+    int area = width * width;
+    int compact_width = width / 2;
+    vector<double> mask(channels_per_ciphertext * area, 0.0);
+    for (int channel = 0; channel < channels_per_ciphertext; channel++) {
+        int begin = channel * area + row * compact_width;
+        fill(mask.begin() + begin, mask.begin() + begin + compact_width, 1.0);
+    }
+    return encode(mask, level, static_cast<int>(mask.size()));
+}
+
+Ptxt FHEController::channel_compaction_mask(int width,
+                                            int channels_per_ciphertext,
+                                            int channel,
+                                            int level) {
+    int area = width * width;
+    int compact_area = area / 4;
+    vector<double> mask(channels_per_ciphertext * area, 0.0);
+    int begin = channel * area;
+    fill(mask.begin() + begin, mask.begin() + begin + compact_area, 1.0);
+    return encode(mask, level, static_cast<int>(mask.size()));
+}
+
+EncryptedTensor FHEController::downsample_stride2_sharded(
+    const EncryptedTensor& in,
+    int output_channels_per_ciphertext,
+    bool timing) {
+    auto start = start_time();
+    int width = in.layout.width;
+    int compact_width = width / 2;
+    int area = in.layout.area();
+    int compact_area = area / 4;
+    int input_group = in.layout.channels_per_ciphertext;
+
+    if (width < 2 || (width & 1) != 0 ||
+        output_channels_per_ciphertext % input_group != 0) {
+        throw invalid_argument("Invalid stride-2 sharded tensor layout");
+    }
+    int merge_factor = output_channels_per_ciphertext / input_group;
+    int compact_chunk_slots = input_group * compact_area;
+    if (output_channels_per_ciphertext * compact_area != in.layout.slots) {
+        throw invalid_argument("Stride-2 output must fill one ciphertext exactly");
+    }
+
+    vector<Ctxt> compacted;
+    compacted.reserve(in.shards.size());
+    for (const Ctxt& shard : in.shards) {
+        Ctxt horizontal = shard->Clone();
+        for (int step = 1; step < compact_width; step *= 2) {
+            horizontal = context->EvalAdd(horizontal, context->EvalRotate(horizontal, step));
+            if (step * 2 < compact_width) {
+                horizontal = context->EvalMult(
+                    horizontal, gen_mask(step * 2, horizontal->GetLevel()));
+            }
+        }
+
+        Ctxt compacted_rows;
+        for (int row = 0; row < compact_width; row++) {
+            Ctxt masked = context->EvalMult(
+                horizontal,
+                row_compaction_mask(width, input_group, row, horizontal->GetLevel()));
+            compacted_rows = compacted_rows
+                ? context->EvalAdd(compacted_rows, masked)
+                : masked;
+            if (row + 1 < compact_width) {
+                horizontal = context->EvalRotate(
+                    horizontal, 2 * width - compact_width);
+            }
+        }
+
+        Ctxt compacted_channels;
+        for (int channel = 0; channel < input_group; channel++) {
+            Ctxt masked = context->EvalMult(
+                compacted_rows,
+                channel_compaction_mask(
+                    width, input_group, channel, compacted_rows->GetLevel()));
+            compacted_channels = compacted_channels
+                ? context->EvalAdd(compacted_channels, masked)
+                : masked;
+            compacted_channels = context->EvalRotate(
+                compacted_channels, -(area - compact_area));
+        }
+        compacted_channels = context->EvalRotate(
+            compacted_channels, (area - compact_area) * input_group);
+        compacted.push_back(compacted_channels);
+    }
+
+    EncryptedTensor result;
+    result.layout = TensorLayout{
+        compact_width,
+        in.layout.channels,
+        output_channels_per_ciphertext,
+        in.layout.slots,
+    };
+    result.shards.resize(result.layout.ciphertext_count());
+
+    for (int source_shard = 0;
+         source_shard < static_cast<int>(compacted.size());
+         source_shard++) {
+        int target_shard = source_shard / merge_factor;
+        int position = source_shard % merge_factor;
+        Ctxt shifted = compacted[source_shard];
+        for (int shift = 0; shift < position; shift++) {
+            shifted = context->EvalRotate(shifted, -compact_chunk_slots);
+        }
+        result.shards[target_shard] = result.shards[target_shard]
+            ? context->EvalAdd(result.shards[target_shard], shifted)
+            : shifted;
+    }
+
+    if (timing) {
+        print_duration(start,
+                       "Stride-2 packing " + to_string(width) + "->" +
+                       to_string(compact_width) + " (" +
+                       to_string(in.shards.size()) + "->" +
+                       to_string(result.shards.size()) + " ciphertexts)");
+    }
+    return result;
+}
+
+EncryptedTensor FHEController::bootstrap_tensor(const EncryptedTensor& in,
+                                                bool timing) {
+    EncryptedTensor result;
+    result.layout = in.layout;
+    result.shards.reserve(in.shards.size());
+    for (const Ctxt& shard : in.shards) {
+        result.shards.push_back(bootstrap(shard, timing));
+    }
+    return result;
+}
+
+EncryptedTensor FHEController::relu_tensor(const EncryptedTensor& in,
+                                           double scale,
+                                           bool timing) {
+    EncryptedTensor result;
+    result.layout = in.layout;
+    result.shards.reserve(in.shards.size());
+    for (const Ctxt& shard : in.shards) {
+        result.shards.push_back(relu(shard, scale, timing));
+    }
+    return result;
+}
+
+EncryptedTensor FHEController::add_tensor(const EncryptedTensor& left,
+                                          const EncryptedTensor& right) {
+    if (left.layout.width != right.layout.width ||
+        left.layout.channels != right.layout.channels ||
+        left.layout.channels_per_ciphertext != right.layout.channels_per_ciphertext ||
+        left.shards.size() != right.shards.size()) {
+        throw invalid_argument("Cannot add encrypted tensors with different layouts");
+    }
+    EncryptedTensor result;
+    result.layout = left.layout;
+    result.shards.reserve(left.shards.size());
+    for (size_t shard = 0; shard < left.shards.size(); shard++) {
+        result.shards.push_back(add(left.shards[shard], right.shards[shard]));
+    }
+    return result;
+}
+
+EncryptedTensor FHEController::mult_tensor(const EncryptedTensor& in,
+                                           double value) {
+    EncryptedTensor result;
+    result.layout = in.layout;
+    result.shards.reserve(in.shards.size());
+    for (const Ctxt& shard : in.shards) {
+        result.shards.push_back(mult(shard, value));
+    }
+    return result;
 }
 
 Ctxt FHEController::convbn1632sxV2(const Ctxt &in, int layer, int n, double scale, bool timing) {

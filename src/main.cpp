@@ -12,15 +12,27 @@
 
 
 void check_arguments(int argc, char *argv[]);
-vector<double> read_image(const char *filename);
+vector<double> read_image(const char *filename, int expected_size = 32);
 
 void executeResNet20();
+void executeResNet64();
+void generate_evaluation_keys64();
 
 Ctxt initial_layer(const Ctxt& in);
 Ctxt layer1(const Ctxt& in);
 Ctxt layer2(const Ctxt& in);
 Ctxt layer3(const Ctxt& in);
 Ctxt final_layer(const Ctxt& in);
+
+EncryptedTensor residual_block64(const EncryptedTensor& in,
+                                 const string& weight_prefix,
+                                 double first_scale,
+                                 double second_scale,
+                                 const string& title);
+EncryptedTensor layer1_64(const EncryptedTensor& in);
+EncryptedTensor layer2_64(const EncryptedTensor& in);
+EncryptedTensor layer3_64(const EncryptedTensor& in);
+Ctxt final_layer64(const EncryptedTensor& in);
 
 FHEController controller;
 
@@ -29,6 +41,7 @@ string input_filename;
 int verbose;
 bool test;
 bool plain;
+int input_resolution;
 
 /*
  * TODO:
@@ -75,6 +88,12 @@ int main(int argc, char *argv[]) {
 
         if (verbose > 1) cout << "(It may take a while, depending on the machine)" << endl;
 
+
+        if (input_resolution == 64) {
+            generate_evaluation_keys64();
+            cout << "64x64 context created correctly." << endl;
+            exit(0);
+        }
 
         controller.generate_bootstrapping_and_rotation_keys({1, -1, 32, -32, -1024},
                                                             16384,
@@ -124,7 +143,290 @@ int main(int argc, char *argv[]) {
         controller.load_context(verbose > 1);
     }
 
-    executeResNet20();
+    if (input_resolution == 64) {
+        executeResNet64();
+    } else {
+        executeResNet20();
+    }
+}
+
+void generate_evaluation_keys64() {
+    // Native 64x64 keeps a 2^16 ring and shards every intermediate tensor into
+    // ciphertexts of exactly 16384 logical CKKS slots.
+    controller.generate_bootstrapping_and_rotation_keys(
+        {1, -1, 64, -64, -4096},
+        16384,
+        true,
+        "rotations-layer1.bin");
+    if (verbose > 1) cout << "1/6 done." << endl;
+
+    controller.clear_context(16384);
+    controller.load_context(false);
+    controller.generate_rotation_keys(
+        {1, 2, 4, 8, 16, 96, -3072, 12288, -4096},
+        true,
+        "rotations-layer2-downsample.bin");
+    if (verbose > 1) cout << "2/6 done." << endl;
+
+    controller.clear_context(0);
+    controller.load_context(false);
+    controller.generate_bootstrapping_and_rotation_keys(
+        {1, -1, 32, -32, -1024},
+        16384,
+        true,
+        "rotations-layer2.bin");
+    if (verbose > 1) cout << "3/6 done." << endl;
+
+    controller.clear_context(16384);
+    controller.load_context(false);
+    controller.generate_rotation_keys(
+        {1, 2, 4, 8, 48, -768, 12288, -4096},
+        true,
+        "rotations-layer3-downsample.bin");
+    if (verbose > 1) cout << "4/6 done." << endl;
+
+    controller.clear_context(0);
+    controller.load_context(false);
+    controller.generate_bootstrapping_and_rotation_keys(
+        {1, -1, 16, -16, -256},
+        16384,
+        true,
+        "rotations-layer3.bin");
+    if (verbose > 1) cout << "5/6 done." << endl;
+
+    controller.clear_context(16384);
+    controller.load_context(false);
+    controller.generate_rotation_keys(
+        {1, 2, 4, 8, 16, 32, 64, 128, -15,
+         256, 512, 1024, 2048, 4096, 8192},
+        true,
+        "rotations-finallayer.bin");
+    if (verbose > 1) cout << "6/6 done!" << endl;
+
+    controller.clear_context(0);
+    controller.load_context(false);
+}
+
+void executeResNet64() {
+    if (verbose >= 0) {
+        cout << "Encrypted ResNet20 native 64x64 classification started." << endl;
+        cout << "Packing: 1 -> 4 -> 2 -> 1 ciphertexts; 16384 slots per ciphertext." << endl;
+    }
+
+    if (input_filename.empty()) {
+        input_filename = "../imgs/cat_64x64.png";
+        if (verbose >= 0) {
+            cout << "You did not set any input, I use " << GREEN_TEXT
+                 << input_filename << RESET_COLOR << "." << endl;
+        }
+    } else if (verbose >= 0) {
+        cout << "I am going to encrypt and classify " << GREEN_TEXT
+             << input_filename << RESET_COLOR << "." << endl;
+    }
+
+    vector<double> input_image = read_image(input_filename.c_str(), 64);
+    controller.num_slots = 16384;
+    TensorLayout input_layout{64, 3, 4, 16384};
+    EncryptedTensor current = controller.encrypt_tensor(
+        input_image,
+        input_layout,
+        controller.circuit_depth - 4 - get_relu_depth(controller.relu_degree));
+
+    bool timing = verbose > 1;
+    controller.load_bootstrapping_and_rotation_keys(
+        "rotations-layer1.bin", 16384, timing);
+
+    auto start = start_time();
+    current = controller.convbn_sharded(
+        current, "../weights/compact_fused/initial.fwgt", 16, 0.90, false, timing);
+    current = controller.relu_tensor(current, 0.90, timing);
+
+    auto start_layer = start_time();
+    current = layer1_64(current);
+    if (verbose > 0) print_duration(start_layer, "64x64 stage 1 took:");
+
+    start_layer = start_time();
+    current = layer2_64(current);
+    if (verbose > 0) print_duration(start_layer, "64x64 stage 2 took:");
+
+    start_layer = start_time();
+    current = layer3_64(current);
+    if (verbose > 0) print_duration(start_layer, "64x64 stage 3 took:");
+
+    final_layer64(current);
+    if (verbose > 0) {
+        print_duration_yellow(start, "The native 64x64 circuit evaluation took: ");
+    }
+}
+
+EncryptedTensor residual_block64(const EncryptedTensor& in,
+                                 const string& weight_prefix,
+                                 double first_scale,
+                                 double second_scale,
+                                 const string& title) {
+    bool timing = verbose > 1;
+    if (timing) cout << "---Start: " << title << "---" << endl;
+    auto start = start_time();
+
+    EncryptedTensor res = controller.convbn_sharded(
+        in, weight_prefix + "_conv1.fwgt", in.layout.channels,
+        first_scale, false, timing);
+    res = controller.bootstrap_tensor(res, timing);
+    res = controller.relu_tensor(res, first_scale, timing);
+    res = controller.convbn_sharded(
+        res, weight_prefix + "_conv2.fwgt", in.layout.channels,
+        second_scale, false, timing);
+    res = controller.add_tensor(res, controller.mult_tensor(in, second_scale));
+    res = controller.bootstrap_tensor(res, timing);
+    res = controller.relu_tensor(res, second_scale, timing);
+
+    if (timing) {
+        print_duration(start, "Total");
+        cout << "---End  : " << title << "---" << endl;
+    }
+    return res;
+}
+
+EncryptedTensor layer1_64(const EncryptedTensor& in) {
+    EncryptedTensor res = residual_block64(
+        in, "../weights/compact_fused/layer1", 1.00, 0.52,
+        "64x64 Stage 1 - Block 1");
+    res = residual_block64(
+        res, "../weights/compact_fused/layer2", 0.55, 0.36,
+        "64x64 Stage 1 - Block 2");
+    return residual_block64(
+        res, "../weights/compact_fused/layer3", 0.63, 0.42,
+        "64x64 Stage 1 - Block 3");
+}
+
+EncryptedTensor layer2_64(const EncryptedTensor& in) {
+    bool timing = verbose > 1;
+    if (timing) cout << "---Start: 64x64 Stage 2 - Block 1---" << endl;
+    auto start = start_time();
+
+    EncryptedTensor boot_in = controller.bootstrap_tensor(in, timing);
+    EncryptedTensor left = controller.convbn_sharded(
+        boot_in, "../weights/compact_fused/layer4_conv1.fwgt",
+        32, 0.57, true, timing);
+    EncryptedTensor right = controller.convbn_sharded(
+        boot_in, "../weights/compact_fused/layer4_downsample.fwgt",
+        32, 0.40, true, timing);
+
+    controller.clear_bootstrapping_and_rotation_keys(16384);
+    controller.load_rotation_keys("rotations-layer2-downsample.bin", timing);
+    left = controller.downsample_stride2_sharded(left, 16, timing);
+    right = controller.downsample_stride2_sharded(right, 16, timing);
+
+    controller.clear_rotation_keys();
+    controller.load_bootstrapping_and_rotation_keys(
+        "rotations-layer2.bin", 16384, timing);
+    left = controller.bootstrap_tensor(left, timing);
+    left = controller.relu_tensor(left, 0.57, timing);
+    left = controller.convbn_sharded(
+        left, "../weights/compact_fused/layer4_conv2.fwgt",
+        32, 0.40, false, timing);
+    EncryptedTensor res = controller.add_tensor(left, right);
+    res = controller.bootstrap_tensor(res, timing);
+    res = controller.relu_tensor(res, 0.40, timing);
+
+    if (timing) {
+        print_duration(start, "Total");
+        cout << "---End  : 64x64 Stage 2 - Block 1---" << endl;
+    }
+
+    res = residual_block64(
+        res, "../weights/compact_fused/layer5", 0.76, 0.37,
+        "64x64 Stage 2 - Block 2");
+    return residual_block64(
+        res, "../weights/compact_fused/layer6", 0.63, 0.25,
+        "64x64 Stage 2 - Block 3");
+}
+
+EncryptedTensor layer3_64(const EncryptedTensor& in) {
+    bool timing = verbose > 1;
+    if (timing) cout << "---Start: 64x64 Stage 3 - Block 1---" << endl;
+    auto start = start_time();
+
+    EncryptedTensor boot_in = controller.bootstrap_tensor(in, timing);
+    EncryptedTensor left = controller.convbn_sharded(
+        boot_in, "../weights/compact_fused/layer7_conv1.fwgt",
+        64, 0.63, true, timing);
+    EncryptedTensor right = controller.convbn_sharded(
+        boot_in, "../weights/compact_fused/layer7_downsample.fwgt",
+        64, 0.40, true, timing);
+
+    controller.clear_bootstrapping_and_rotation_keys(16384);
+    controller.load_rotation_keys("rotations-layer3-downsample.bin", timing);
+    left = controller.downsample_stride2_sharded(left, 64, timing);
+    right = controller.downsample_stride2_sharded(right, 64, timing);
+
+    controller.clear_rotation_keys();
+    controller.load_bootstrapping_and_rotation_keys(
+        "rotations-layer3.bin", 16384, timing);
+    left = controller.bootstrap_tensor(left, timing);
+    left = controller.relu_tensor(left, 0.63, timing);
+    left = controller.convbn_sharded(
+        left, "../weights/compact_fused/layer7_conv2.fwgt",
+        64, 0.40, false, timing);
+    EncryptedTensor res = controller.add_tensor(left, right);
+    res = controller.bootstrap_tensor(res, timing);
+    res = controller.relu_tensor(res, 0.40, timing);
+
+    if (timing) {
+        print_duration(start, "Total");
+        cout << "---End  : 64x64 Stage 3 - Block 1---" << endl;
+    }
+
+    res = residual_block64(
+        res, "../weights/compact_fused/layer8", 0.57, 0.33,
+        "64x64 Stage 3 - Block 2");
+    res = residual_block64(
+        res, "../weights/compact_fused/layer9", 0.69, 0.10,
+        "64x64 Stage 3 - Block 3");
+    return controller.bootstrap_tensor(res, timing);
+}
+
+Ctxt final_layer64(const EncryptedTensor& in) {
+    if (in.layout.width != 16 || in.layout.channels != 64 ||
+        in.layout.channels_per_ciphertext != 64 || in.shards.size() != 1) {
+        throw invalid_argument("Unexpected encrypted tensor layout before 64x64 final layer");
+    }
+
+    controller.clear_bootstrapping_and_rotation_keys(16384);
+    controller.load_rotation_keys("rotations-finallayer.bin", verbose > 1);
+    controller.num_slots = 16384;
+
+    const Ctxt& packed = in.shards[0];
+    Ptxt weight = controller.encode(
+        read_fc_weight("../weights/fc.bin", 256),
+        packed->GetLevel(),
+        controller.num_slots);
+
+    Ctxt res = controller.rotsum(packed, 256);
+    res = controller.mult(
+        res, controller.mask_mod(256, res->GetLevel(), 1.0 / 256.0));
+    res = controller.repeat(res, 16);
+    res = controller.mult(res, weight);
+    res = controller.rotsum_padded_blocks(res, 256, 64);
+
+    if (verbose >= 0) {
+        cout << "Decrypting the output..." << endl;
+        controller.print(res, 10, "Output: ");
+    }
+
+    vector<double> clear_result = controller.decrypt_tovector(res, 10);
+    auto max_element_iterator = max_element(clear_result.begin(), clear_result.end());
+    int index_max = distance(clear_result.begin(), max_element_iterator);
+    if (verbose >= 0) {
+        cout << "The input image is classified as " << YELLOW_TEXT
+             << utils::get_class(index_max) << RESET_COLOR << endl;
+        cout << "The index of max element is " << YELLOW_TEXT
+             << index_max << RESET_COLOR << endl;
+        if (plain) {
+            cout << "Plain PyTorch comparison is only available for the original 32x32 path." << endl;
+        }
+    }
+    return res;
 }
 
 void executeResNet20() {
@@ -478,21 +780,32 @@ Ctxt layer1(const Ctxt& in) {
 void check_arguments(int argc, char *argv[]) {
     generate_context = -1;
     verbose = 0;
+    test = false;
+    plain = false;
+    input_resolution = 64;
 
     for (int i = 1; i < argc; ++i) {
-        //I first check the "verbose" command
+        // Parse options that affect all later path decisions first.
         if (string(argv[i]) == "verbose") {
-            if (i + 1 < argc) { // Verifica se c'è un argomento successivo a "input"
+            if (i + 1 < argc) {
                 verbose = atoi(argv[i + 1]);
             }
         }
+        if (string(argv[i]) == "resolution" && i + 1 < argc) {
+            input_resolution = atoi(argv[i + 1]);
+        }
     }
 
+    if (input_resolution != 32 && input_resolution != 64) {
+        cerr << "This branch supports 'resolution 32' and 'resolution 64'." << endl;
+        exit(1);
+    }
 
     for (int i = 1; i < argc; ++i) {
         if (string(argv[i]) == "load_keys") {
             if (i + 1 < argc) {
                 controller.parameters_folder = "keys_exp" + string(argv[i + 1]);
+                if (input_resolution == 64) controller.parameters_folder += "_64";
                 if (verbose > 1) cout << "Context folder set to: \"" << controller.parameters_folder << "\"." << endl;
                 generate_context = 0;
             }
@@ -522,6 +835,8 @@ void check_arguments(int argc, char *argv[]) {
                     exit(1);
                 }
 
+                if (input_resolution == 64) folder += "_64";
+
                 struct stat sb;
                 if (stat(("../" + folder).c_str(), &sb) == 0) {
                     cerr << "The keys folder \"" << folder << "\" already exists, I will abort.";
@@ -550,19 +865,28 @@ void check_arguments(int argc, char *argv[]) {
 
 }
 
-vector<double> read_image(const char *filename) {
-    int width = 32;
-    int height = 32;
-    int channels = 3;
-    unsigned char* image_data = stbi_load(filename, &width, &height, &channels, 0);
+vector<double> read_image(const char *filename, int expected_size) {
+    int width = 0;
+    int height = 0;
+    int channels_in_file = 0;
+    unsigned char* image_data = stbi_load(
+        filename, &width, &height, &channels_in_file, 3);
 
     if (!image_data) {
         cerr << "Could not load the image in " << filename << endl;
-        return vector<double>();
+        exit(1);
+    }
+
+    if (width != expected_size || height != expected_size) {
+        cerr << "Expected an exact " << expected_size << "x" << expected_size
+             << " image, but " << filename << " is " << width << "x" << height
+             << ". Resize it explicitly before encrypted inference." << endl;
+        stbi_image_free(image_data);
+        exit(1);
     }
 
     vector<double> imageVector;
-    imageVector.reserve(width * height * channels);
+    imageVector.reserve(width * height * 3);
 
     for (int i = 0; i < width * height; ++i) {
         //Channel R

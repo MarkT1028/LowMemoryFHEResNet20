@@ -114,15 +114,19 @@ namespace utils {
         return values;
     }
 
-    static inline vector<double> read_fc_weight (const string& filename) {
-        vector<double> weight = read_values_from_file("../weights/fc.bin");
+    static inline vector<double> read_fc_weight (const string& filename, int channel_block_size = 64) {
+        if (channel_block_size < 10) {
+            throw invalid_argument("The fully-connected channel block must contain at least 10 class slots");
+        }
+
+        vector<double> weight = read_values_from_file(filename);
         vector<double> weight_corrected;
 
         for (int i = 0; i < 64; i++) {
             for (int j = 0; j < 10; j++) {
                 weight_corrected.push_back(weight[(10 * i) + j]);
             }
-            for (int j = 0; j < 64 - 10; j++) {
+            for (int j = 0; j < channel_block_size - 10; j++) {
                 weight_corrected.push_back(0);
             }
         }

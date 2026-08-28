@@ -60,6 +60,60 @@ The idea is to use $b$, which, without the secret key $s$ would look like a rand
 
 ## How to run
 
+### Native 64x64 branch
+
+This branch adds a native `64x64` inference path while preserving the original
+`32x32` implementation. It does not resize a 64x64 image back to CIFAR-10
+resolution. Instead, it evaluates the same trained ResNet20 weights over the
+larger spatial grid:
+
+- input: `3 x 64 x 64`, padded to four channel blocks in one ciphertext;
+- stage 1: `16 x 64 x 64` in four ciphertexts;
+- stage 2: `32 x 32 x 32` in two ciphertexts;
+- stage 3: `64 x 16 x 16` in one ciphertext;
+- all ciphertexts use at most 16384 logical CKKS slots, so the ring dimension
+  remains `2^16`.
+
+The included test image is `imgs/cat_64x64.png`. Image dimensions are checked
+strictly: the 64x64 path rejects any image that is not exactly 64x64. The model
+weights are still the CIFAR-10 weights trained on 32x32 inputs, so timing and
+memory comparisons are meaningful, but classification accuracy at 64x64 must
+be measured separately and should not be assumed to match the paper's 32x32
+result.
+
+From the `build` directory, generate a separate 64x64 key set:
+
+```bash
+./LowMemoryFHEResNet20 generate_keys 3 resolution 64 verbose 1
+```
+
+This writes `keys_exp3_64` and never overwrites `keys_exp3`. Key generation is
+disk- and memory-intensive. Make sure WSL has ample free disk space and RAM
+before starting it.
+
+Run the bundled 64x64 image:
+
+```bash
+/usr/bin/time -v ./LowMemoryFHEResNet20 load_keys 3 resolution 64 \
+  input "imgs/cat_64x64.png" verbose 1
+```
+
+`resolution 64` is the default on this branch. The upstream 32x32 path remains
+available explicitly:
+
+```bash
+./LowMemoryFHEResNet20 load_keys 3 resolution 32 input "inputs/luis.png"
+```
+
+The small resolution-independent fused files in `weights/compact_fused` are
+derived exactly from the upstream expanded plaintext weights. They can be
+recreated and checked without PyTorch or a model download:
+
+```bash
+python3 tools/export_compact_fused_weights.py
+python3 tools/validate_compact_fused_weights.py
+```
+
 > [!IMPORTANT]
 > With newer versions of OpenFHE, a `DropLastElement: Removing last element of DCRTPoly renders it invalid.` error may pop up. This happens because of an additional multiplication performed by the bootstrapping. I suggest you two solutions:
 > - Relax the security parameters to (NotSet) and increase the circuit depth by 1. This will not give you a 128-bits secure circuit anymore, something less.
@@ -101,9 +155,10 @@ and run it with the following command:
 
 - `generate_keys`, type `int`, a value in `[1, 2, 3, 4]`
 - `load_keys`, type: `int` a value in `[1, 2, 3, 4]`
-- `input`, type: `string`, the filename of a custom image. **MUST** be a three channel RGB 32x32 image either in `.jpg` or in `.png` format
+- `input`, type: `string`, the filename of a custom image. It **MUST** match the selected resolution exactly (`32x32` or `64x64`) and may be `.jpg` or `.png`; inputs are decoded as RGB
 - `verbose` a value in `[-1, 0, 1, 2]`, the first shows no information, the last shows a lot of messages
-- `plain`: added when the user wants the plain result too. Note: enabling this option means that a Python script will be executed after the encrypted inference. This script requires the following modules: `torch`, `torchvision`, `PIL`, `numpy`.
+- `plain`: added when the user wants the plain result too. This comparison is currently available only for the original 32x32 path. It requires `torch`, `torchvision`, `PIL`, and `numpy`.
+- `resolution`, type: `int`, either `32` or `64`; this branch defaults to `64`
 
 #### Some examples 
 

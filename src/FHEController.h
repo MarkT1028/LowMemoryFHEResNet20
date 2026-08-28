@@ -24,6 +24,39 @@ using namespace utils;
 using Ptxt = Plaintext;
 using Ctxt = Ciphertext<DCRTPoly>;
 
+struct TensorLayout {
+    int width = 0;
+    int channels = 0;
+    int channels_per_ciphertext = 0;
+    int slots = 0;
+
+    int area() const {
+        return width * width;
+    }
+
+    int ciphertext_count() const {
+        return (channels + channels_per_ciphertext - 1) / channels_per_ciphertext;
+    }
+};
+
+struct EncryptedTensor {
+    TensorLayout layout;
+    vector<Ctxt> shards;
+};
+
+struct FusedConvWeights {
+    int out_channels = 0;
+    int in_channels = 0;
+    int kernel_size = 0;
+    vector<double> weights;
+    vector<double> bias;
+
+    double at(int output_channel, int input_channel, int kernel_index) const {
+        int kernel_elements = kernel_size * kernel_size;
+        return weights[((output_channel * in_channels) + input_channel) * kernel_elements + kernel_index];
+    }
+};
+
 class FHEController {
     CryptoContext<DCRTPoly> context;
 
@@ -106,8 +139,31 @@ public:
 
     Ctxt rotsum(const Ctxt &in, int slots);
     Ctxt rotsum_padded(const Ctxt &in, int slots);
+    Ctxt rotsum_padded_blocks(const Ctxt& in, int block_size, int blocks);
 
     Ctxt repeat(const Ctxt &in, int slots);
+
+    /*
+     * Resolution-independent channel-sharded tensors.  The native 64x64 path
+     * keeps every ciphertext at or below 16384 logical slots, so it can reuse
+     * the paper's 2^16 ring dimension instead of increasing memory fourfold.
+     */
+    EncryptedTensor encrypt_tensor(const vector<double>& values,
+                                   const TensorLayout& layout,
+                                   int level = 0);
+    EncryptedTensor convbn_sharded(const EncryptedTensor& in,
+                                   const string& compact_weight_file,
+                                   int output_channels,
+                                   double scale = 0.5,
+                                   bool stride2_output = false,
+                                   bool timing = false);
+    EncryptedTensor downsample_stride2_sharded(const EncryptedTensor& in,
+                                               int output_channels_per_ciphertext,
+                                               bool timing = false);
+    EncryptedTensor bootstrap_tensor(const EncryptedTensor& in, bool timing = false);
+    EncryptedTensor relu_tensor(const EncryptedTensor& in, double scale, bool timing = false);
+    EncryptedTensor add_tensor(const EncryptedTensor& left, const EncryptedTensor& right);
+    EncryptedTensor mult_tensor(const EncryptedTensor& in, double value);
 
     //TODO: studia sta roba
     Ctxt convbnV2(const Ctxt &in, int layer, int n, double scale = 0.5, bool timing = false);
@@ -137,6 +193,33 @@ public:
 private:
     KeyPair<DCRTPoly> key_pair;
     vector<uint32_t> level_budget = {4, 4};
+
+    FusedConvWeights load_fused_conv_weights(const string& filename) const;
+    vector<Ctxt> spatial_rotations(const Ctxt& in, int width, int kernel_size);
+    Ptxt sharded_conv_diagonal(const FusedConvWeights& weights,
+                               const TensorLayout& input_layout,
+                               int input_shard,
+                               int output_shard,
+                               int output_channels,
+                               int diagonal,
+                               int kernel_index,
+                               int level,
+                               double scale,
+                               bool stride2_output);
+    Ptxt sharded_bias(const FusedConvWeights& weights,
+                      const TensorLayout& output_layout,
+                      int output_shard,
+                      int level,
+                      double scale,
+                      bool stride2_output);
+    Ptxt row_compaction_mask(int width,
+                             int channels_per_ciphertext,
+                             int row,
+                             int level);
+    Ptxt channel_compaction_mask(int width,
+                                 int channels_per_ciphertext,
+                                 int channel,
+                                 int level);
 
 
 };
