@@ -21,6 +21,8 @@ void executeResNet64();
 void executeResNet128();
 void executeResNet128FinalFromCheckpoint();
 void executeResNet128RefreshFromCheckpoint();
+void executeResNet128ReluFromCheckpoint();
+void executeResNet128Stage3FromCheckpoint();
 void executeFinalProbe128();
 void executeRefreshProbe128();
 void generate_evaluation_keys64();
@@ -47,12 +49,17 @@ EncryptedTensor layer3_native(const EncryptedTensor& in,
                               int output_channels_per_ciphertext);
 EncryptedTensor layer2_128(EncryptedTensor in);
 EncryptedTensor layer3_128(EncryptedTensor in);
+EncryptedTensor final_residual_block_128(const EncryptedTensor& in,
+                                         bool timing);
 EncryptedTensor refresh_stage3_128(EncryptedTensor in, bool timing);
 Ctxt final_layer64(const EncryptedTensor& in);
 Ctxt final_layer128(const EncryptedTensor& in,
                     double decrypted_output_scale = 1.0);
 
 FHEController controller;
+
+constexpr double NATIVE128_STAGE3_REFRESH_SCALE = 1.0 / 16.0;
+constexpr double NATIVE128_DECRYPTED_OUTPUT_SCALE = 160.0;
 
 int generate_context;
 string input_filename;
@@ -61,6 +68,8 @@ bool test;
 bool plain;
 bool resume_final128;
 bool resume_refresh128;
+bool resume_relu128;
+bool resume_stage3_128;
 bool probe_final128;
 bool probe_refresh128;
 int input_resolution;
@@ -176,6 +185,10 @@ int main(int argc, char *argv[]) {
         executeFinalProbe128();
     } else if (input_resolution == 128 && resume_refresh128) {
         executeResNet128RefreshFromCheckpoint();
+    } else if (input_resolution == 128 && resume_relu128) {
+        executeResNet128ReluFromCheckpoint();
+    } else if (input_resolution == 128 && resume_stage3_128) {
+        executeResNet128Stage3FromCheckpoint();
     } else if (input_resolution == 128 && resume_final128) {
         executeResNet128FinalFromCheckpoint();
     } else if (input_resolution == 128) {
@@ -381,13 +394,14 @@ void executeResNet128() {
     start_layer = start_time();
     current = layer2_128(std::move(current));
     if (verbose > 0) print_duration(start_layer, "128x128 stage 2 took:");
+    save_tensor_checkpoint(current, "native128-stage2-v4");
 
     start_layer = start_time();
     current = layer3_128(std::move(current));
     if (verbose > 0) print_duration(start_layer, "128x128 stage 3 took:");
 
-    save_tensor_checkpoint(current, "native128-stage3-scaled-v3");
-    final_layer128(current, 16.0);
+    save_tensor_checkpoint(current, "native128-stage3-scaled-v4");
+    final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
     if (verbose > 0) {
         print_duration_yellow(start, "The native 128x128 circuit evaluation took: ");
     }
@@ -414,8 +428,9 @@ void save_tensor_checkpoint(const EncryptedTensor& tensor,
     }
 
     if (verbose >= 0) {
-        cout << "Saved " << tensor.shards.size()
-             << " Stage 3 ciphertext checkpoints in ../checkpoints/." << endl;
+        cout << "Saved checkpoint set '" << prefix << "' with "
+             << tensor.shards.size() << " ciphertexts in ../checkpoints/."
+             << endl;
     }
 }
 
@@ -437,8 +452,9 @@ EncryptedTensor load_tensor_checkpoint(const TensorLayout& layout,
     }
 
     if (verbose >= 0) {
-        cout << "Loaded " << tensor.shards.size()
-             << " Stage 3 ciphertext checkpoints from ../checkpoints/." << endl;
+        cout << "Loaded checkpoint set '" << prefix << "' with "
+             << tensor.shards.size() << " ciphertexts from ../checkpoints/."
+             << endl;
     }
     return tensor;
 }
@@ -478,7 +494,7 @@ void executeResNet128FinalFromCheckpoint() {
     controller.num_slots = 16384;
     TensorLayout stage3_layout{32, 64, 16, 16384};
     EncryptedTensor current = load_tensor_checkpoint(
-        stage3_layout, "native128-stage3-scaled-v3");
+        stage3_layout, "native128-stage3-scaled-v4");
     for (size_t shard = 0; shard < current.shards.size(); shard++) {
         print_ciphertext_stats(
             current.shards[shard],
@@ -486,7 +502,7 @@ void executeResNet128FinalFromCheckpoint() {
     }
 
     auto start = start_time();
-    final_layer128(current, 16.0);
+    final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
     if (verbose > 0) {
         print_duration_yellow(start, "The resumed 128x128 final layer took: ");
     }
@@ -501,17 +517,68 @@ void executeResNet128RefreshFromCheckpoint() {
     controller.num_slots = 16384;
     TensorLayout stage3_layout{32, 64, 16, 16384};
     EncryptedTensor current = load_tensor_checkpoint(
-        stage3_layout, "native128-stage3-unrefreshed-v3");
+        stage3_layout, "native128-stage3-unrefreshed-v4");
+    for (size_t shard = 0; shard < current.shards.size(); shard++) {
+        print_ciphertext_stats(
+            current.shards[shard],
+            "Unrefreshed checkpoint shard " + to_string(shard));
+    }
     controller.load_bootstrapping_and_rotation_keys(
         "rotations-layer3.bin", 16384, verbose > 1);
 
     auto start = start_time();
     current = refresh_stage3_128(std::move(current), verbose > 1);
-    save_tensor_checkpoint(current, "native128-stage3-scaled-v3");
-    final_layer128(current, 16.0);
+    save_tensor_checkpoint(current, "native128-stage3-scaled-v4");
+    final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
     if (verbose > 0) {
         print_duration_yellow(
             start, "The resumed 128x128 refresh and final layer took: ");
+    }
+}
+
+void executeResNet128ReluFromCheckpoint() {
+    if (verbose >= 0) {
+        cout << "Resuming the native 128x128 final ReLU from checkpoint."
+             << endl;
+    }
+
+    controller.num_slots = 16384;
+    TensorLayout stage3_layout{32, 64, 16, 16384};
+    EncryptedTensor current = load_tensor_checkpoint(
+        stage3_layout, "native128-layer9-pre-relu-v4");
+    auto start = start_time();
+    current = controller.relu_tensor(current, 1.0, verbose > 1);
+    save_tensor_checkpoint(current, "native128-stage3-unrefreshed-v4");
+    controller.load_bootstrapping_and_rotation_keys(
+        "rotations-layer3.bin", 16384, verbose > 1);
+    current = refresh_stage3_128(std::move(current), verbose > 1);
+    save_tensor_checkpoint(current, "native128-stage3-scaled-v4");
+    final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
+    if (verbose > 0) {
+        print_duration_yellow(
+            start, "The resumed final ReLU, refresh, and final layer took: ");
+    }
+}
+
+void executeResNet128Stage3FromCheckpoint() {
+    if (verbose >= 0) {
+        cout << "Resuming the native 128x128 Stage 3 from checkpoint." << endl;
+    }
+
+    controller.num_slots = 16384;
+    TensorLayout stage2_layout{64, 32, 4, 16384};
+    EncryptedTensor current = load_tensor_checkpoint(
+        stage2_layout, "native128-stage2-v4");
+    controller.load_bootstrapping_and_rotation_keys(
+        "rotations-layer2.bin", 16384, verbose > 1);
+
+    auto start = start_time();
+    current = layer3_128(std::move(current));
+    save_tensor_checkpoint(current, "native128-stage3-scaled-v4");
+    final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
+    if (verbose > 0) {
+        print_duration_yellow(
+            start, "The resumed 128x128 Stage 3 and final layer took: ");
     }
 }
 
@@ -577,8 +644,8 @@ void executeRefreshProbe128() {
     if (verbose >= 0) {
         cout << "Running a synthetic 128x128 Stage 3 refresh and final-layer probe."
              << endl;
-        cout << "The synthetic features reach the same magnitude range observed "
-             << "in the real checkpoint." << endl;
+        cout << "The probe includes the degree-" << controller.relu_degree
+             << " final ReLU with its retained 0.10 scale." << endl;
     }
 
     controller.num_slots = 16384;
@@ -588,12 +655,15 @@ void executeRefreshProbe128() {
     for (int channel = 0; channel < stage3_layout.channels; channel++) {
         for (int pixel = 0; pixel < stage3_layout.area(); pixel++) {
             synthetic_values[channel * stage3_layout.area() + pixel] =
-                0.25 + 0.1 * channel + 0.001 * (pixel % 32);
+                -0.15 + 0.01 * channel + 0.001 * (pixel % 32);
         }
     }
 
     EncryptedTensor synthetic = controller.encrypt_tensor(
-        synthetic_values, stage3_layout, controller.circuit_depth - 3);
+        synthetic_values,
+        stage3_layout,
+        controller.circuit_depth - 3 - get_relu_depth(controller.relu_degree));
+    synthetic = controller.relu_tensor(synthetic, 1.0, verbose > 1);
     controller.load_bootstrapping_and_rotation_keys(
         "rotations-layer3.bin", 16384, verbose > 1);
 
@@ -606,10 +676,11 @@ void executeRefreshProbe128() {
     }
 
     auto start = start_time();
-    Ctxt encrypted_result = final_layer128(refreshed, 16.0);
+    Ctxt encrypted_result = final_layer128(
+        refreshed, NATIVE128_DECRYPTED_OUTPUT_SCALE);
     vector<double> actual = controller.decrypt_tovector(encrypted_result, 10);
     for (double& value : actual) {
-        value *= 16.0;
+        value *= NATIVE128_DECRYPTED_OUTPUT_SCALE;
     }
 
     vector<double> fc_weights = read_values_from_file("../weights/fc.bin");
@@ -620,10 +691,12 @@ void executeRefreshProbe128() {
     for (int channel = 0; channel < stage3_layout.channels; channel++) {
         double channel_average = 0.0;
         for (int pixel = 0; pixel < stage3_layout.area(); pixel++) {
-            channel_average +=
-                synthetic_values[channel * stage3_layout.area() + pixel];
+            channel_average += max(
+                0.0,
+                synthetic_values[channel * stage3_layout.area() + pixel]);
         }
         channel_average /= stage3_layout.area();
+        channel_average *= 10.0;
         for (int class_index = 0; class_index < 10; class_index++) {
             expected[class_index] +=
                 channel_average * fc_weights[channel * 10 + class_index];
@@ -870,28 +943,59 @@ EncryptedTensor layer3_128(EncryptedTensor in) {
     res = residual_block_native(
         res, "../weights/compact_fused/layer8", 0.57, 0.33,
         "128x128 Stage 3 - Block 2");
-    res = residual_block_native(
-        res, "../weights/compact_fused/layer9", 0.69, 0.10,
-        "128x128 Stage 3 - Block 3");
+    res = final_residual_block_128(res, timing);
 
     // Keep the expensive CNN result before its final refresh. If a future
     // OpenFHE parameter adjustment is needed, resume_refresh can retry from
     // here without evaluating the three ResNet stages again.
-    save_tensor_checkpoint(res, "native128-stage3-unrefreshed-v3");
+    save_tensor_checkpoint(res, "native128-stage3-unrefreshed-v4");
     return refresh_stage3_128(std::move(res), timing);
 }
 
+EncryptedTensor final_residual_block_128(const EncryptedTensor& in,
+                                         bool timing) {
+    if (timing) cout << "---Start: 128x128 Stage 3 - Block 3---" << endl;
+    auto start = start_time();
+
+    EncryptedTensor res = controller.convbn_sharded(
+        in, "../weights/compact_fused/layer9_conv1.fwgt",
+        in.layout.channels, 0.69, false, timing);
+    res = controller.bootstrap_tensor(res, timing);
+    res = controller.relu_tensor(res, 0.69, timing);
+    res = controller.convbn_sharded(
+        res, "../weights/compact_fused/layer9_conv2.fwgt",
+        in.layout.channels, 0.10, false, timing);
+    res = controller.add_tensor(res, controller.mult_tensor(in, 0.10));
+    res = controller.bootstrap_tensor(res, timing);
+
+    // Save the clean pre-activation so a final-ReLU adjustment never requires
+    // rerunning the CNN. Keep the 0.10 factor already present in the residual
+    // branch instead of amplifying the ciphertext and its approximation error
+    // by ten. ReLU is positively homogeneous; the factor is restored only
+    // after client-side decryption.
+    save_tensor_checkpoint(res, "native128-layer9-pre-relu-v4");
+    res = controller.relu_tensor(res, 1.0, timing);
+
+    if (timing) {
+        print_duration(start, "Total");
+        cout << "---End  : 128x128 Stage 3 - Block 3---" << endl;
+    }
+    return res;
+}
+
 EncryptedTensor refresh_stage3_128(EncryptedTensor res, bool timing) {
-    // The final ReLU leaves each shard at level 24/25 and can produce values
-    // above 1. Consume the remaining level while scaling into a stable
-    // bootstrapping interval. The positive 1/16 factor is restored only after
-    // decryption, so it does not change the predicted class and does not amplify
-    // ciphertext noise in the final homomorphic reduction.
+    // The final ReLU leaves each shard at level 24/25 and its output is
+    // deliberately kept at one tenth of the original activation. Consume
+    // the remaining level while scaling into a stable bootstrapping interval.
+    // The positive factor is restored only after decryption, so it does not
+    // change the predicted class and does not amplify ciphertext noise in the
+    // final homomorphic reduction.
     EncryptedTensor refreshed;
     refreshed.layout = res.layout;
     refreshed.shards.reserve(res.shards.size());
     for (const Ctxt& shard : res.shards) {
-        Ctxt depleted_and_scaled = controller.mult(shard, 1.0 / 16.0);
+        Ctxt depleted_and_scaled = controller.mult(
+            shard, NATIVE128_STAGE3_REFRESH_SCALE);
         depleted_and_scaled = controller.rescale(depleted_and_scaled);
         refreshed.shards.push_back(
             controller.bootstrap(depleted_and_scaled, 17, timing));
@@ -1372,6 +1476,8 @@ void check_arguments(int argc, char *argv[]) {
     plain = false;
     resume_final128 = false;
     resume_refresh128 = false;
+    resume_relu128 = false;
+    resume_stage3_128 = false;
     probe_final128 = false;
     probe_refresh128 = false;
     input_resolution = 128;
@@ -1416,6 +1522,14 @@ void check_arguments(int argc, char *argv[]) {
 
         if (string(argv[i]) == "resume_refresh") {
             resume_refresh128 = true;
+        }
+
+        if (string(argv[i]) == "resume_relu") {
+            resume_relu128 = true;
+        }
+
+        if (string(argv[i]) == "resume_stage3") {
+            resume_stage3_128 = true;
         }
 
         if (string(argv[i]) == "probe_final") {
@@ -1476,11 +1590,12 @@ void check_arguments(int argc, char *argv[]) {
 
     int special_modes = static_cast<int>(resume_final128) +
                         static_cast<int>(resume_refresh128) +
+                        static_cast<int>(resume_relu128) +
+                        static_cast<int>(resume_stage3_128) +
                         static_cast<int>(probe_final128) +
                         static_cast<int>(probe_refresh128);
     if (special_modes > 1) {
-        cerr << "Use only one of 'resume_final', 'resume_refresh', "
-             << "'probe_final', or 'probe_refresh'." << endl;
+        cerr << "Use only one resume or probe mode at a time." << endl;
         exit(1);
     }
     if (special_modes > 0 && input_resolution != 128) {
