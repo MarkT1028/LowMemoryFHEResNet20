@@ -481,6 +481,10 @@ Ctxt FHEController::mult(const Ctxt &c, const Ptxt& p) {
     return context->EvalMult(c, p);
 }
 
+Ctxt FHEController::rescale(const Ctxt& c) {
+    return context->Rescale(c);
+}
+
 Ctxt FHEController::bootstrap(const Ctxt &c, bool timing) {
     if (static_cast<int>(c->GetLevel()) + 2 < circuit_depth && timing) {
         cout << "You are bootstrapping with remaining levels! You are at " << to_string(c->GetLevel()) << "/" << circuit_depth - 2 << endl;
@@ -499,7 +503,7 @@ Ctxt FHEController::bootstrap(const Ctxt &c, bool timing) {
 }
 
 Ctxt FHEController::bootstrap(const Ctxt &c, int precision, bool timing) {
-    if (static_cast<int>(c->GetLevel()) + 2 < circuit_depth) {
+    if (static_cast<int>(c->GetLevel()) + 2 < circuit_depth && timing) {
         cout << "You are bootstrapping with remaining levels! You are at " << to_string(c->GetLevel()) << "/" << circuit_depth - 2 << endl;
     }
 

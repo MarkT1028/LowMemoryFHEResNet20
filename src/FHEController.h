@@ -109,6 +109,7 @@ public:
     Ctxt add(const Ctxt& c1, const Ctxt& c2);
     Ctxt mult(const Ctxt& c, double d);
     Ctxt mult(const Ctxt& c, const Ptxt& p);
+    Ctxt rescale(const Ctxt& c);
     Ctxt bootstrap(const Ctxt& c, bool timing = false);
     Ctxt bootstrap(const Ctxt& c, int precision, bool timing = false);
     Ctxt relu(const Ctxt& c, double scale, bool timing = false);
