@@ -93,12 +93,22 @@ void FHEController::generate_context(bool serialize) {
     }
 }
 
-void FHEController::generate_context(int log_ring, int log_scale, int log_primes, int digits_hks, int cts_levels,
-                                     int stc_levels, int relu_deg, bool serialize) {
+void FHEController::generate_context(int log_ring,
+                                     int log_scale,
+                                     int log_primes,
+                                     int digits_hks,
+                                     int cts_levels,
+                                     int stc_levels,
+                                     int relu_deg,
+                                     bool serialize,
+                                     int batch_slots) {
 
     CCParams<CryptoContextCKKSRNS> parameters;
 
-    num_slots = 1 << 14;
+    if (batch_slots <= 0 || batch_slots > (1 << (log_ring - 1))) {
+        throw invalid_argument("CKKS batch size exceeds the selected ring capacity");
+    }
+    num_slots = batch_slots;
 
     parameters.SetSecretKeyDist(SPARSE_TERNARY);
     parameters.SetSecurityLevel(lbcrypto::HEStd_128_classic);

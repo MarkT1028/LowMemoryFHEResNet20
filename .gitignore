@@ -72,6 +72,10 @@ keys_exp1_128
 keys_exp2_128
 keys_exp3_128
 keys_exp4_128
+keys_exp1_256
+keys_exp2_256
+keys_exp3_256
+keys_exp4_256
 
 checkpoints
 build

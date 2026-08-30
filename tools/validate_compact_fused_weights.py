@@ -265,10 +265,10 @@ def validate_native_downsample(width: int, group_channels: int, output_group: in
         raise AssertionError("native stride-2 packing")
 
 
-def validate_final_layer_128() -> None:
+def validate_final_layer_high_resolution(width: int) -> None:
     """Check the four-shard global average + fully-connected decomposition."""
-    rng = np.random.default_rng(128010)
-    source = rng.normal(size=(64, 32, 32))
+    rng = np.random.default_rng(width * 1000 + 10)
+    source = rng.normal(size=(64, width, width))
     fc = load_text("fc.bin").reshape(64, 10)
     expected = source.mean(axis=(1, 2)) @ fc
 
@@ -279,9 +279,13 @@ def validate_final_layer_128() -> None:
         actual += source[first:last].mean(axis=(1, 2)) @ fc[first:last]
 
     error = float(np.max(np.abs(actual - expected)))
-    print(f"128x128 four-shard final layer: max error {error:.3e}")
+    input_resolution = width * 4
+    print(
+        f"{input_resolution}x{input_resolution} four-shard final layer: "
+        f"max error {error:.3e}"
+    )
     if error > 1e-10:
-        raise AssertionError("128x128 final layer")
+        raise AssertionError(f"{input_resolution}x{input_resolution} final layer")
 
 
 def validate_square(name: str, source_prefix: str, channels: int, width: int) -> None:
@@ -369,5 +373,8 @@ if __name__ == "__main__":
     validate_native_downsample(128, 1, 4)
     validate_native_downsample(64, 4, 16)
     validate_native_downsample(32, 16, 64)
-    validate_final_layer_128()
+    validate_native_downsample(256, 1, 4)
+    validate_native_downsample(128, 4, 16)
+    validate_final_layer_high_resolution(32)
+    validate_final_layer_high_resolution(64)
     print("Compact fused weights match the upstream expanded packing.")

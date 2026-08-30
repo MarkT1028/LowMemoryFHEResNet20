@@ -60,7 +60,89 @@ The idea is to use $b$, which, without the secret key $s$ would look like a rand
 
 ## How to run
 
-### Native 128x128 branch
+### Native 256x256 path
+
+This branch adds an exact `256x256` encrypted path. The input is **not** resized
+to 128x128 or 32x32 before encryption. Its packing is:
+
+- input: `3 x 256 x 256` in three ciphertexts, one channel per ciphertext;
+- stage 1: `16 x 256 x 256` in sixteen ciphertexts;
+- stage 2: `32 x 128 x 128` in eight ciphertexts, four channels each;
+- stage 3: `64 x 64 x 64` in four ciphertexts, sixteen channels each;
+- every ciphertext uses 65536 CKKS slots and a `2^17` ring dimension.
+
+Because the ring is twice as large as the 128x128 path, 256x256 needs an
+independent key directory. `keys_exp3_128` cannot be reused. On a 32 GiB Windows
+host, allocate as much WSL memory as practical and keep swap enabled. The
+development machine's current 21 GiB WSL RAM plus 12 GiB swap completed the
+Experiment 3 key generation in about 10:55 with a 20.85 GiB peak resident set
+and no swap use. Keep the swap allocation as safety margin for full inference;
+it is substantially slower and more disk-intensive than 128x128.
+
+The bundled test input is the exact RGB image `inputs/horse_256x256.png`.
+Generate Experiment 3 keys from `build`:
+
+```bash
+set -o pipefail
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  generate_keys 3 resolution 256 verbose 1 \
+  2>&1 | tee ../logs/keygen_exp3_256.log
+```
+
+This creates `keys_exp3_256` without changing any 32x32, 64x64, or 128x128
+keys. Before committing to the full run, validate both the final aggregation
+and the precision-protection path:
+
+```bash
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 probe_final verbose 1
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 probe_refresh verbose 1
+```
+
+On the development machine these passed with maximum absolute errors of about
+`7.54e-10` and `6.98e-2`, respectively. Run the horse image with:
+
+```bash
+set -o pipefail
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 256 \
+  input "inputs/horse_256x256.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_256.log
+```
+
+The 256x256 path saves these independent recovery points:
+
+- `checkpoints/native256-stage2-v1-shard[0-7].bin` after Stage 2;
+- `checkpoints/native256-layer9-pre-relu-v1-shard[0-3].bin` immediately before
+  the final ReLU;
+- `checkpoints/native256-stage3-unrefreshed-v1-shard[0-3].bin` after the final
+  ReLU;
+- `checkpoints/native256-stage3-scaled-v1-shard[0-3].bin` immediately before
+  the final fully-connected layer.
+
+Use the same recovery commands as the 128x128 path, but select resolution 256:
+
+```bash
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 resume_final verbose 1
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 resume_refresh verbose 1
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 resume_relu verbose 1
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 resume_stage3 verbose 1
+```
+
+The 128x128 precision failure is handled from the start: the final activation
+uses a degree-59 Chebyshev ReLU on `[-2, 2]`, preserves the existing positive
+`0.10` factor, stores a clean pre-ReLU checkpoint, scales by another `1/16`
+before a two-iteration bootstrap, and restores the combined `1/160` factor only
+after client-side decryption. The 64x64 global average is scaled by `1/4096`
+before its rotate-and-add reduction.
+
+Horse is CIFAR-10 index `7`. This repository's weights were trained on 32x32
+CIFAR-10 images, so a horse label at 256x256 is a useful functional check, not
+a guarantee of accuracy. A scientific comparison must evaluate a labelled set
+consistently at every resolution.
+
+`resolution 256` is the default on this branch.
+
+### Native 128x128 path
 
 This branch adds native `128x128` and `64x64` inference paths while preserving
 the original `32x32` implementation. A larger input is not resized back to
@@ -182,9 +264,9 @@ The CIFAR-10 label for dog is index `5`. The included network was trained on
 not a guaranteed correctness check. A real accuracy comparison requires a
 labelled test set evaluated consistently at every resolution.
 
-`resolution 128` is the default on this branch. The 128x128 path uses
-substantially more ciphertexts than 64x64, so allow considerably more RAM and
-runtime. Key generation is also disk-intensive.
+The 128x128 path remains available explicitly. It uses substantially more
+ciphertexts than 64x64, so allow considerably more RAM and runtime. Key
+generation is also disk-intensive.
 
 ### Native 64x64 path
 
@@ -277,16 +359,16 @@ and run it with the following command:
 
 - `generate_keys`, type `int`, a value in `[1, 2, 3, 4]`
 - `load_keys`, type: `int` a value in `[1, 2, 3, 4]`
-- `input`, type: `string`, the filename of a custom image. It **MUST** match the selected resolution exactly (`32x32`, `64x64`, or `128x128`) and may be `.jpg` or `.png`; inputs are decoded as RGB
+- `input`, type: `string`, the filename of a custom image. It **MUST** match the selected resolution exactly (`32x32`, `64x64`, `128x128`, or `256x256`) and may be `.jpg` or `.png`; inputs are decoded as RGB
 - `verbose` a value in `[-1, 0, 1, 2]`, the first shows no information, the last shows a lot of messages
 - `plain`: added when the user wants the plain result too. This comparison is currently available only for the original 32x32 path. It requires `torch`, `torchvision`, `PIL`, and `numpy`.
-- `resolution`, type: `int`, either `32`, `64`, or `128`; this branch defaults to `128`
-- `probe_final`: with `resolution 128`, run a synthetic final-layer check without the three CNN stages
-- `resume_final`: with `resolution 128`, load the four saved Stage 3 ciphertexts and rerun only the final layer
-- `probe_refresh`: with `resolution 128`, stress-test the normalized Stage 3 bootstrap and final layer
-- `resume_refresh`: with `resolution 128`, load the unrefreshed Stage 3 checkpoint and rerun its refresh plus the final layer
-- `resume_relu`: with `resolution 128`, load the final pre-ReLU checkpoint and rerun the final ReLU, refresh, and final layer
-- `resume_stage3`: with `resolution 128`, load the Stage 2 checkpoint and rerun Stage 3 plus the final layer
+- `resolution`, type: `int`, either `32`, `64`, `128`, or `256`; this branch defaults to `256`
+- `probe_final`: with `resolution 128` or `256`, run a synthetic final-layer check without the three CNN stages
+- `resume_final`: with `resolution 128` or `256`, load the four saved Stage 3 ciphertexts and rerun only the final layer
+- `probe_refresh`: with `resolution 128` or `256`, stress-test the normalized Stage 3 bootstrap and final layer
+- `resume_refresh`: with `resolution 128` or `256`, load the unrefreshed Stage 3 checkpoint and rerun its refresh plus the final layer
+- `resume_relu`: with `resolution 128` or `256`, load the final pre-ReLU checkpoint and rerun the final ReLU, refresh, and final layer
+- `resume_stage3`: with `resolution 128` or `256`, load the Stage 2 checkpoint and rerun Stage 3 plus the final layer
 
 #### Some examples 
 
