@@ -163,6 +163,12 @@ public:
                                                bool timing = false);
     EncryptedTensor bootstrap_tensor(const EncryptedTensor& in, bool timing = false);
     EncryptedTensor relu_tensor(const EncryptedTensor& in, double scale, bool timing = false);
+    EncryptedTensor relu_tensor_wide(const EncryptedTensor& in,
+                                     double lower_bound,
+                                     double upper_bound,
+                                     int degree,
+                                     double scale,
+                                     bool timing = false);
     EncryptedTensor add_tensor(const EncryptedTensor& left, const EncryptedTensor& right);
     EncryptedTensor mult_tensor(const EncryptedTensor& in, double value);
 

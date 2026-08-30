@@ -536,18 +536,6 @@ Ctxt FHEController::relu(const Ctxt &c, double scale, bool timing) {
 Ctxt FHEController::relu_wide(const Ctxt &c, double a, double b, int degree, double scale, bool timing) {
     auto start = start_time();
 
-    /*
-     * Max min
-     */
-    Ptxt result;
-    context->Decrypt(key_pair.secretKey, c, &result);
-    vector<double> v = result->GetRealPackedValue();
-
-    cout << "min: " << *min_element(v.begin(), v.end()) << ", max: " << *max_element(v.begin(), v.end()) << endl;
-    /*
-     * Max min
-     */
-
     Ctxt res = context->EvalChebyshevFunction([scale](double x) -> double { if (x < 0) return 0; else return (1 / scale) * x; }, c,
                                               a,
                                               b, degree);
@@ -1758,6 +1746,22 @@ EncryptedTensor FHEController::relu_tensor(const EncryptedTensor& in,
     result.shards.reserve(in.shards.size());
     for (const Ctxt& shard : in.shards) {
         result.shards.push_back(relu(shard, scale, timing));
+    }
+    return result;
+}
+
+EncryptedTensor FHEController::relu_tensor_wide(const EncryptedTensor& in,
+                                                double lower_bound,
+                                                double upper_bound,
+                                                int degree,
+                                                double scale,
+                                                bool timing) {
+    EncryptedTensor result;
+    result.layout = in.layout;
+    result.shards.reserve(in.shards.size());
+    for (const Ctxt& shard : in.shards) {
+        result.shards.push_back(
+            relu_wide(shard, lower_bound, upper_bound, degree, scale, timing));
     }
     return result;
 }

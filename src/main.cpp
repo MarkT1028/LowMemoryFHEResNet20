@@ -60,6 +60,8 @@ FHEController controller;
 
 constexpr double NATIVE128_STAGE3_REFRESH_SCALE = 1.0 / 16.0;
 constexpr double NATIVE128_DECRYPTED_OUTPUT_SCALE = 160.0;
+constexpr int NATIVE128_FINAL_RELU_DEGREE = 59;
+constexpr double NATIVE128_FINAL_RELU_BOUND = 1.25;
 
 int generate_context;
 string input_filename;
@@ -400,7 +402,7 @@ void executeResNet128() {
     current = layer3_128(std::move(current));
     if (verbose > 0) print_duration(start_layer, "128x128 stage 3 took:");
 
-    save_tensor_checkpoint(current, "native128-stage3-scaled-v4");
+    save_tensor_checkpoint(current, "native128-stage3-scaled-v6");
     final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
     if (verbose > 0) {
         print_duration_yellow(start, "The native 128x128 circuit evaluation took: ");
@@ -494,7 +496,7 @@ void executeResNet128FinalFromCheckpoint() {
     controller.num_slots = 16384;
     TensorLayout stage3_layout{32, 64, 16, 16384};
     EncryptedTensor current = load_tensor_checkpoint(
-        stage3_layout, "native128-stage3-scaled-v4");
+        stage3_layout, "native128-stage3-scaled-v6");
     for (size_t shard = 0; shard < current.shards.size(); shard++) {
         print_ciphertext_stats(
             current.shards[shard],
@@ -517,7 +519,7 @@ void executeResNet128RefreshFromCheckpoint() {
     controller.num_slots = 16384;
     TensorLayout stage3_layout{32, 64, 16, 16384};
     EncryptedTensor current = load_tensor_checkpoint(
-        stage3_layout, "native128-stage3-unrefreshed-v4");
+        stage3_layout, "native128-stage3-unrefreshed-v6");
     for (size_t shard = 0; shard < current.shards.size(); shard++) {
         print_ciphertext_stats(
             current.shards[shard],
@@ -528,7 +530,7 @@ void executeResNet128RefreshFromCheckpoint() {
 
     auto start = start_time();
     current = refresh_stage3_128(std::move(current), verbose > 1);
-    save_tensor_checkpoint(current, "native128-stage3-scaled-v4");
+    save_tensor_checkpoint(current, "native128-stage3-scaled-v6");
     final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
     if (verbose > 0) {
         print_duration_yellow(
@@ -546,13 +548,29 @@ void executeResNet128ReluFromCheckpoint() {
     TensorLayout stage3_layout{32, 64, 16, 16384};
     EncryptedTensor current = load_tensor_checkpoint(
         stage3_layout, "native128-layer9-pre-relu-v4");
+    for (size_t shard = 0; shard < current.shards.size(); shard++) {
+        print_ciphertext_stats(
+            current.shards[shard],
+            "Pre-ReLU checkpoint shard " + to_string(shard));
+    }
     auto start = start_time();
-    current = controller.relu_tensor(current, 1.0, verbose > 1);
-    save_tensor_checkpoint(current, "native128-stage3-unrefreshed-v4");
+    current = controller.relu_tensor_wide(
+        current,
+        -NATIVE128_FINAL_RELU_BOUND,
+        NATIVE128_FINAL_RELU_BOUND,
+        NATIVE128_FINAL_RELU_DEGREE,
+        1.0,
+        verbose > 1);
+    for (size_t shard = 0; shard < current.shards.size(); shard++) {
+        print_ciphertext_stats(
+            current.shards[shard],
+            "Post-ReLU checkpoint shard " + to_string(shard));
+    }
+    save_tensor_checkpoint(current, "native128-stage3-unrefreshed-v6");
     controller.load_bootstrapping_and_rotation_keys(
         "rotations-layer3.bin", 16384, verbose > 1);
     current = refresh_stage3_128(std::move(current), verbose > 1);
-    save_tensor_checkpoint(current, "native128-stage3-scaled-v4");
+    save_tensor_checkpoint(current, "native128-stage3-scaled-v6");
     final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
     if (verbose > 0) {
         print_duration_yellow(
@@ -574,7 +592,7 @@ void executeResNet128Stage3FromCheckpoint() {
 
     auto start = start_time();
     current = layer3_128(std::move(current));
-    save_tensor_checkpoint(current, "native128-stage3-scaled-v4");
+    save_tensor_checkpoint(current, "native128-stage3-scaled-v6");
     final_layer128(current, NATIVE128_DECRYPTED_OUTPUT_SCALE);
     if (verbose > 0) {
         print_duration_yellow(
@@ -644,8 +662,11 @@ void executeRefreshProbe128() {
     if (verbose >= 0) {
         cout << "Running a synthetic 128x128 Stage 3 refresh and final-layer probe."
              << endl;
-        cout << "The probe includes the degree-" << controller.relu_degree
-             << " final ReLU with its retained 0.10 scale." << endl;
+        cout << "The probe includes the degree-"
+             << NATIVE128_FINAL_RELU_DEGREE << " final ReLU on [-"
+             << NATIVE128_FINAL_RELU_BOUND << ", "
+             << NATIVE128_FINAL_RELU_BOUND
+             << "] with its retained 0.10 scale." << endl;
     }
 
     controller.num_slots = 16384;
@@ -655,15 +676,21 @@ void executeRefreshProbe128() {
     for (int channel = 0; channel < stage3_layout.channels; channel++) {
         for (int pixel = 0; pixel < stage3_layout.area(); pixel++) {
             synthetic_values[channel * stage3_layout.area() + pixel] =
-                -0.15 + 0.01 * channel + 0.001 * (pixel % 32);
+                -0.58 + 0.025 * channel + 0.0015 * (pixel % 32);
         }
     }
 
     EncryptedTensor synthetic = controller.encrypt_tensor(
         synthetic_values,
         stage3_layout,
-        controller.circuit_depth - 3 - get_relu_depth(controller.relu_degree));
-    synthetic = controller.relu_tensor(synthetic, 1.0, verbose > 1);
+        17);
+    synthetic = controller.relu_tensor_wide(
+        synthetic,
+        -NATIVE128_FINAL_RELU_BOUND,
+        NATIVE128_FINAL_RELU_BOUND,
+        NATIVE128_FINAL_RELU_DEGREE,
+        1.0,
+        verbose > 1);
     controller.load_bootstrapping_and_rotation_keys(
         "rotations-layer3.bin", 16384, verbose > 1);
 
@@ -710,9 +737,12 @@ void executeRefreshProbe128() {
     }
     cout << "Refresh probe maximum absolute error after client-side rescaling: "
          << scientific << setprecision(6) << max_error << defaultfloat << endl;
-    if (max_error > 1e-2) {
+    // This comparison includes the deliberate degree-59 approximation of the
+    // non-smooth ReLU as well as CKKS error. 0.075 is below 0.5% of the
+    // probe's largest logit while leaving room for encryption randomness.
+    if (max_error > 7.5e-2) {
         throw runtime_error(
-            "The 128x128 refresh probe exceeded the 1e-2 error tolerance");
+            "The 128x128 refresh probe exceeded the 7.5e-2 error tolerance");
     }
     if (verbose > 0) {
         print_duration_yellow(
@@ -948,7 +978,7 @@ EncryptedTensor layer3_128(EncryptedTensor in) {
     // Keep the expensive CNN result before its final refresh. If a future
     // OpenFHE parameter adjustment is needed, resume_refresh can retry from
     // here without evaluating the three ResNet stages again.
-    save_tensor_checkpoint(res, "native128-stage3-unrefreshed-v4");
+    save_tensor_checkpoint(res, "native128-stage3-unrefreshed-v6");
     return refresh_stage3_128(std::move(res), timing);
 }
 
@@ -971,10 +1001,18 @@ EncryptedTensor final_residual_block_128(const EncryptedTensor& in,
     // Save the clean pre-activation so a final-ReLU adjustment never requires
     // rerunning the CNN. Keep the 0.10 factor already present in the residual
     // branch instead of amplifying the ciphertext and its approximation error
-    // by ten. ReLU is positively homogeneous; the factor is restored only
-    // after client-side decryption.
+    // by ten. Use a lower-degree polynomial on [-1.25, 1.25], because the real
+    // shard-2 activation can slightly exceed 1.0 and Chebyshev extrapolation
+    // outside [-1, 1] destabilizes that shard. ReLU is positively homogeneous;
+    // the retained factor is restored only after client-side decryption.
     save_tensor_checkpoint(res, "native128-layer9-pre-relu-v4");
-    res = controller.relu_tensor(res, 1.0, timing);
+    res = controller.relu_tensor_wide(
+        res,
+        -NATIVE128_FINAL_RELU_BOUND,
+        NATIVE128_FINAL_RELU_BOUND,
+        NATIVE128_FINAL_RELU_DEGREE,
+        1.0,
+        timing);
 
     if (timing) {
         print_duration(start, "Total");
