@@ -293,6 +293,39 @@ void FHEController::test_context() {
     cout << "Test completed." << endl;
 }
 
+bool FHEController::test_encrypted_model_parameter_ops() {
+    const vector<double> input_values = {1.25, -2.0, 0.5, 4.0};
+    const vector<double> weight_values = {2.0, -0.5, 3.0, 0.25};
+    const vector<double> bias_values = {0.5, 1.0, -1.0, 2.0};
+    const vector<double> expected = {3.0, 2.0, 0.5, 3.0};
+
+    set_encrypt_model_parameters(true);
+    Ctxt encrypted_input = encrypt(input_values, 0, num_slots);
+    Ptxt weight = encode(weight_values, encrypted_input->GetLevel(), num_slots);
+    Ctxt product = mult_model_parameter(encrypted_input, weight);
+    Ptxt bias = encode(bias_values, product->GetLevel(), num_slots);
+    Ctxt result = add_model_parameter(product, bias);
+    vector<double> actual = decrypt_tovector(result, expected.size());
+
+    double max_error = 0.0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        max_error = max(max_error, abs(actual[i] - expected[i]));
+    }
+
+    cout << "Encrypted model-parameter self-test output: [ ";
+    for (size_t i = 0; i < actual.size(); ++i) {
+        cout << actual[i] << (i + 1 == actual.size() ? " ]" : ", ");
+    }
+    cout << endl;
+    cout << "Expected output: [ 3, 2, 0.5, 3 ]" << endl;
+    cout << "Maximum absolute error: " << max_error << endl;
+    print_model_parameter_stats();
+
+    const bool passed = max_error < 0.01;
+    cout << "Encrypted model-parameter self-test: " << (passed ? "PASS" : "FAIL") << endl;
+    return passed;
+}
+
 void FHEController::generate_bootstrapping_keys(int bootstrap_slots) {
     context->EvalBootstrapSetup(level_budget, {0, 0}, bootstrap_slots);
     context->EvalBootstrapKeyGen(key_pair.secretKey, bootstrap_slots);
@@ -479,6 +512,65 @@ Ctxt FHEController::mult(const Ctxt &c1, double d) {
 
 Ctxt FHEController::mult(const Ctxt &c, const Ptxt& p) {
     return context->EvalMult(c, p);
+}
+
+void FHEController::set_encrypt_model_parameters(bool enabled) {
+    encrypt_model_parameters = enabled;
+}
+
+bool FHEController::model_parameters_are_encrypted() const {
+    return encrypt_model_parameters;
+}
+
+Ctxt FHEController::encrypt_model_parameter(const Ptxt& parameter,
+                                             bool multiplicative) {
+    auto start = steady_clock::now();
+    Ctxt encrypted = encrypt_ptxt(parameter);
+    model_parameter_encryption_time += duration_cast<nanoseconds>(steady_clock::now() - start);
+
+    if (multiplicative) {
+        ++encrypted_weight_count;
+    } else {
+        ++encrypted_bias_count;
+    }
+
+    return encrypted;
+}
+
+Ctxt FHEController::mult_model_parameter(const Ctxt& c,
+                                         const Ptxt& parameter) {
+    if (!encrypt_model_parameters) {
+        return context->EvalMult(c, parameter);
+    }
+
+    Ctxt encrypted_weight = encrypt_model_parameter(parameter, true);
+    return context->EvalMult(c, encrypted_weight);
+}
+
+Ctxt FHEController::add_model_parameter(const Ctxt& c,
+                                        const Ptxt& parameter) {
+    if (!encrypt_model_parameters) {
+        return context->EvalAdd(c, parameter);
+    }
+
+    Ctxt encrypted_bias = encrypt_model_parameter(parameter, false);
+    return context->EvalAdd(c, encrypted_bias);
+}
+
+void FHEController::print_model_parameter_stats() const {
+    cout << "Model parameter mode: "
+         << (encrypt_model_parameters ? "CKKS ciphertext" : "CKKS plaintext") << endl;
+
+    if (!encrypt_model_parameters) {
+        return;
+    }
+
+    const auto milliseconds_spent = duration_cast<milliseconds>(model_parameter_encryption_time).count();
+    cout << "Encrypted multiplicative parameter operands: " << encrypted_weight_count << endl;
+    cout << "Encrypted additive parameter operands: " << encrypted_bias_count << endl;
+    cout << "On-demand model parameter encryption time: "
+         << milliseconds_spent / 1000.0 << " seconds" << endl;
+    cout << "Note: this preparation time is included in the timed end-to-end run." << endl;
 }
 
 Ctxt FHEController::rescale(const Ctxt& c) {
@@ -1557,7 +1649,7 @@ EncryptedTensor FHEController::convbn_sharded(const EncryptedTensor& in,
                         scale,
                         stride2_output);
                     kernel_terms.push_back(
-                        context->EvalMult(rotations[kernel_index], diagonal_weights));
+                        mult_model_parameter(rotations[kernel_index], diagonal_weights));
                 }
 
                 Ctxt diagonal_sum = kernel_terms.size() == 1
@@ -1590,7 +1682,7 @@ EncryptedTensor FHEController::convbn_sharded(const EncryptedTensor& in,
             result.shards[output_shard]->GetLevel(),
             scale,
             stride2_output);
-        result.shards[output_shard] = context->EvalAdd(result.shards[output_shard], bias);
+        result.shards[output_shard] = add_model_parameter(result.shards[output_shard], bias);
     }
 
     if (timing) {

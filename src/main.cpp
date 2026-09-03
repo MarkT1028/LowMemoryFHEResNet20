@@ -75,6 +75,7 @@ bool resume_stage3_128;
 bool probe_final128;
 bool probe_refresh128;
 int input_resolution;
+bool test_encrypted_weights;
 
 /*
  * TODO:
@@ -181,6 +182,10 @@ int main(int argc, char *argv[]) {
         controller.load_context(verbose > 1);
     }
 
+    if (test_encrypted_weights) {
+        exit(controller.test_encrypted_model_parameter_ops() ? 0 : 1);
+    }
+
     if (input_resolution == 128 && probe_refresh128) {
         executeRefreshProbe128();
     } else if (input_resolution == 128 && probe_final128) {
@@ -199,6 +204,10 @@ int main(int argc, char *argv[]) {
         executeResNet64();
     } else {
         executeResNet20();
+    }
+
+    if (verbose >= 0 && input_resolution != 32) {
+        controller.print_model_parameter_stats();
     }
 }
 
@@ -359,6 +368,11 @@ void executeResNet128() {
     if (verbose >= 0) {
         cout << "Encrypted ResNet20 native 128x128 classification started." << endl;
         cout << "Packing: 3 -> 16 -> 8 -> 4 ciphertexts; 16384 slots per ciphertext." << endl;
+        cout << "Model parameters are "
+             << (controller.model_parameters_are_encrypted()
+                 ? "encrypted CKKS ciphertexts."
+                 : "CKKS plaintexts.")
+             << endl;
     }
 
     if (input_filename.empty()) {
@@ -1061,7 +1075,7 @@ Ctxt final_layer64(const EncryptedTensor& in) {
     res = controller.mult(
         res, controller.mask_mod(256, res->GetLevel(), 1.0 / 256.0));
     res = controller.repeat(res, 16);
-    res = controller.mult(res, weight);
+    res = controller.mult_model_parameter(res, weight);
     res = controller.rotsum_padded_blocks(res, 256, 64);
 
     if (verbose >= 0) {
@@ -1122,7 +1136,7 @@ Ctxt final_layer128(const EncryptedTensor& in,
         partial = controller.repeat(partial, 16);
         print_ciphertext_stats(
             partial, "Final shard " + to_string(shard) + " repeated");
-        partial = controller.mult(partial, weight);
+        partial = controller.mult_model_parameter(partial, weight);
         print_ciphertext_stats(
             partial, "Final shard " + to_string(shard) + " weighted");
         partial = controller.rotsum_padded_blocks(partial, 1024, 16);
@@ -1519,6 +1533,7 @@ void check_arguments(int argc, char *argv[]) {
     probe_final128 = false;
     probe_refresh128 = false;
     input_resolution = 128;
+    test_encrypted_weights = false;
 
     for (int i = 1; i < argc; ++i) {
         // Parse options that affect all later path decisions first.
@@ -1552,6 +1567,10 @@ void check_arguments(int argc, char *argv[]) {
 
         if (string(argv[i]) == "test") {
             test = true;
+        }
+
+        if (string(argv[i]) == "test_encrypted_weights") {
+            test_encrypted_weights = true;
         }
 
         if (string(argv[i]) == "resume_final") {
@@ -1624,6 +1643,24 @@ void check_arguments(int argc, char *argv[]) {
             plain = true;
         }
 
+        if (string(argv[i]) == "weights") {
+            if (i + 1 >= argc) {
+                cerr << "The 'weights' argument requires either 'encrypted' or 'plaintext'." << endl;
+                exit(1);
+            }
+
+            string mode = string(argv[i + 1]);
+            if (mode == "encrypted") {
+                controller.set_encrypt_model_parameters(true);
+            } else if (mode == "plaintext") {
+                controller.set_encrypt_model_parameters(false);
+            } else {
+                cerr << "Unknown weight mode '" << mode
+                     << "'. Use 'weights encrypted' or 'weights plaintext'." << endl;
+                exit(1);
+            }
+        }
+
     }
 
     int special_modes = static_cast<int>(resume_final128) +
@@ -1634,6 +1671,10 @@ void check_arguments(int argc, char *argv[]) {
                         static_cast<int>(probe_refresh128);
     if (special_modes > 1) {
         cerr << "Use only one resume or probe mode at a time." << endl;
+        exit(1);
+    }
+    if (test_encrypted_weights && special_modes > 0) {
+        cerr << "Do not combine 'test_encrypted_weights' with a resume or probe mode." << endl;
         exit(1);
     }
     if (special_modes > 0 && input_resolution != 128) {
