@@ -73,6 +73,7 @@ public:
     void generate_context(int log_ring, int log_scale, int log_primes, int digits_hks, int cts_levels, int stc_levels, int relu_deg, bool serialize = false);
     void load_context(bool verbose = true);
     void test_context();
+    bool test_encrypted_model_parameter_ops();
 
     /*
      * Generating bootstrapping and rotation keys stuff
@@ -109,6 +110,11 @@ public:
     Ctxt add(const Ctxt& c1, const Ctxt& c2);
     Ctxt mult(const Ctxt& c, double d);
     Ctxt mult(const Ctxt& c, const Ptxt& p);
+    Ctxt mult_model_parameter(const Ctxt& c, const Ptxt& parameter);
+    Ctxt add_model_parameter(const Ctxt& c, const Ptxt& parameter);
+    void set_encrypt_model_parameters(bool enabled);
+    bool model_parameters_are_encrypted() const;
+    void print_model_parameter_stats() const;
     Ctxt bootstrap(const Ctxt& c, bool timing = false);
     Ctxt bootstrap(const Ctxt& c, int precision, bool timing = false);
     Ctxt relu(const Ctxt& c, double scale, bool timing = false);
@@ -191,8 +197,14 @@ public:
     string parameters_folder = "NO_FOLDER";
 
 private:
+    Ctxt encrypt_model_parameter(const Ptxt& parameter, bool multiplicative);
+
     KeyPair<DCRTPoly> key_pair;
     vector<uint32_t> level_budget = {4, 4};
+    bool encrypt_model_parameters = true;
+    uint64_t encrypted_weight_count = 0;
+    uint64_t encrypted_bias_count = 0;
+    chrono::nanoseconds model_parameter_encryption_time = chrono::nanoseconds::zero();
 
     FusedConvWeights load_fused_conv_weights(const string& filename) const;
     vector<Ctxt> spatial_rotations(const Ctxt& in, int width, int kernel_size);

@@ -81,6 +81,59 @@ memory comparisons are meaningful, but classification accuracy at 64x64 must
 be measured separately and should not be assumed to match the paper's 32x32
 result.
 
+### Native 64x64 encrypted-model-parameter experiment
+
+This branch changes the native 64x64 path so its learned model parameters can be
+used either as CKKS ciphertexts or as the original CKKS plaintexts. Encrypted
+mode is the default. It covers:
+
+- every compact Conv+BN fused convolution diagonal generated from
+  `weights/compact_fused/*.fwgt`;
+- every compact Conv+BN fused bias;
+- the final fully connected layer weights.
+
+Packing masks and fixed residual-path scale factors are circuit constants, not
+learned parameters, and remain plaintext. Parameter ciphertexts are encrypted
+on demand and released after their multiply/add operation so that thousands of
+large ciphertexts do not remain resident at once. The program reports the
+number of encrypted operands and the accumulated parameter-encryption time.
+
+The existing `keys_exp3_64` can be reused: its EvalMult/relinearization key
+already supports ciphertext-ciphertext multiplication. First run the inexpensive
+correctness test from the `build` directory:
+
+```bash
+./LowMemoryFHEResNet20 load_keys 3 resolution 64 \
+  test_encrypted_weights verbose 1
+```
+
+Then run the controlled comparison with the same key set and image:
+
+```bash
+# Control: encrypted activations x plaintext model parameters
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 64 weights plaintext \
+  input "inputs/cat_64x64.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_64_plain_weights.log
+
+# Experiment: encrypted activations x encrypted model parameters
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 64 weights encrypted \
+  input "inputs/cat_64x64.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_64_encrypted_weights.log
+```
+
+The full encrypted run performs about 14,801 encrypted multiplicative parameter
+operands plus 67 encrypted bias operands, so it can take substantially longer
+than the plaintext-parameter 64x64 run.
+
+> [!IMPORTANT]
+> This is a single-process performance experiment. The process reads the clear
+> compact parameter files and encrypts each encoded operand immediately before
+> use. The homomorphic multiply/add operands are genuine ciphertexts, but a
+> complete model-confidential protocol would encrypt parameters offline and
+> would not give the inference server access to the clear `.fwgt` files.
+
 From the `build` directory, generate a separate 64x64 key set:
 
 ```bash
@@ -159,6 +212,8 @@ and run it with the following command:
 - `verbose` a value in `[-1, 0, 1, 2]`, the first shows no information, the last shows a lot of messages
 - `plain`: added when the user wants the plain result too. This comparison is currently available only for the original 32x32 path. It requires `torch`, `torchvision`, `PIL`, and `numpy`.
 - `resolution`, type: `int`, either `32` or `64`; this branch defaults to `64`
+- `weights`, followed by `encrypted` or `plaintext`; this branch defaults to `encrypted` for the native 64x64 path
+- `test_encrypted_weights`: run a small ciphertext-weight correctness test instead of the full ResNet20 inference; use it together with `load_keys`
 
 #### Some examples 
 

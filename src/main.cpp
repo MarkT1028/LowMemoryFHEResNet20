@@ -42,6 +42,7 @@ int verbose;
 bool test;
 bool plain;
 int input_resolution;
+bool test_encrypted_weights;
 
 /*
  * TODO:
@@ -143,6 +144,10 @@ int main(int argc, char *argv[]) {
         controller.load_context(verbose > 1);
     }
 
+    if (test_encrypted_weights) {
+        exit(controller.test_encrypted_model_parameter_ops() ? 0 : 1);
+    }
+
     if (input_resolution == 64) {
         executeResNet64();
     } else {
@@ -211,6 +216,11 @@ void executeResNet64() {
     if (verbose >= 0) {
         cout << "Encrypted ResNet20 native 64x64 classification started." << endl;
         cout << "Packing: 1 -> 4 -> 2 -> 1 ciphertexts; 16384 slots per ciphertext." << endl;
+        cout << "Model parameters are "
+             << (controller.model_parameters_are_encrypted()
+                 ? "encrypted CKKS ciphertexts."
+                 : "CKKS plaintexts.")
+             << endl;
     }
 
     if (input_filename.empty()) {
@@ -257,6 +267,7 @@ void executeResNet64() {
     if (verbose > 0) {
         print_duration_yellow(start, "The native 64x64 circuit evaluation took: ");
     }
+    if (verbose >= 0) controller.print_model_parameter_stats();
 }
 
 EncryptedTensor residual_block64(const EncryptedTensor& in,
@@ -406,7 +417,7 @@ Ctxt final_layer64(const EncryptedTensor& in) {
     res = controller.mult(
         res, controller.mask_mod(256, res->GetLevel(), 1.0 / 256.0));
     res = controller.repeat(res, 16);
-    res = controller.mult(res, weight);
+    res = controller.mult_model_parameter(res, weight);
     res = controller.rotsum_padded_blocks(res, 256, 64);
 
     if (verbose >= 0) {
@@ -783,6 +794,7 @@ void check_arguments(int argc, char *argv[]) {
     test = false;
     plain = false;
     input_resolution = 64;
+    test_encrypted_weights = false;
 
     for (int i = 1; i < argc; ++i) {
         // Parse options that affect all later path decisions first.
@@ -813,6 +825,10 @@ void check_arguments(int argc, char *argv[]) {
 
         if (string(argv[i]) == "test") {
             test = true;
+        }
+
+        if (string(argv[i]) == "test_encrypted_weights") {
+            test_encrypted_weights = true;
         }
 
         if (string(argv[i]) == "generate_keys") {
@@ -859,6 +875,24 @@ void check_arguments(int argc, char *argv[]) {
 
         if (string(argv[i]) == "plain") {
             plain = true;
+        }
+
+        if (string(argv[i]) == "weights") {
+            if (i + 1 >= argc) {
+                cerr << "The 'weights' argument requires either 'encrypted' or 'plaintext'." << endl;
+                exit(1);
+            }
+
+            string mode = string(argv[i + 1]);
+            if (mode == "encrypted") {
+                controller.set_encrypt_model_parameters(true);
+            } else if (mode == "plaintext") {
+                controller.set_encrypt_model_parameters(false);
+            } else {
+                cerr << "Unknown weight mode '" << mode
+                     << "'. Use 'weights encrypted' or 'weights plaintext'." << endl;
+                exit(1);
+            }
         }
 
     }
