@@ -293,6 +293,40 @@ void FHEController::test_context() {
     cout << "Test completed." << endl;
 }
 
+bool FHEController::test_encrypted_model_parameter_ops() {
+    const vector<double> input_values = {1.25, -2.0, 0.5, 4.0};
+    const vector<double> weight_values = {2.0, -0.5, 3.0, 0.25};
+    const vector<double> bias_values = {0.5, 1.0, -1.0, 2.0};
+    const vector<double> expected = {3.0, 2.0, 0.5, 3.0};
+
+    set_encrypt_model_parameters(true);
+    Ctxt encrypted_input = encrypt(input_values, 0, num_slots);
+    Ctxt product = mult_model_parameter(encrypted_input,
+                                        weight_values,
+                                        encrypted_input->GetLevel(),
+                                        num_slots);
+    Ctxt result = add_model_parameter(product, bias_values, product->GetLevel(), num_slots);
+    vector<double> actual = decrypt_tovector(result, expected.size());
+
+    double max_error = 0.0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        max_error = max(max_error, abs(actual[i] - expected[i]));
+    }
+
+    cout << "Encrypted model-parameter self-test output: [ ";
+    for (size_t i = 0; i < actual.size(); ++i) {
+        cout << actual[i] << (i + 1 == actual.size() ? " ]" : ", ");
+    }
+    cout << endl;
+    cout << "Expected output: [ 3, 2, 0.5, 3 ]" << endl;
+    cout << "Maximum absolute error: " << max_error << endl;
+    print_model_parameter_stats();
+
+    const bool passed = max_error < 0.01;
+    cout << "Encrypted model-parameter self-test: " << (passed ? "PASS" : "FAIL") << endl;
+    return passed;
+}
+
 void FHEController::generate_bootstrapping_keys(int bootstrap_slots) {
     context->EvalBootstrapSetup(level_budget, {0, 0}, bootstrap_slots);
     context->EvalBootstrapKeyGen(key_pair.secretKey, bootstrap_slots);
@@ -479,6 +513,71 @@ Ctxt FHEController::mult(const Ctxt &c1, double d) {
 
 Ctxt FHEController::mult(const Ctxt &c, const Ptxt& p) {
     return context->EvalMult(c, p);
+}
+
+void FHEController::set_encrypt_model_parameters(bool enabled) {
+    encrypt_model_parameters = enabled;
+}
+
+bool FHEController::model_parameters_are_encrypted() const {
+    return encrypt_model_parameters;
+}
+
+Ctxt FHEController::encrypt_model_parameter(const vector<double>& values,
+                                             int level,
+                                             int plaintext_num_slots,
+                                             bool multiplicative) {
+    auto start = steady_clock::now();
+    Ctxt encrypted = encrypt_ptxt(encode(values, level, plaintext_num_slots));
+    model_parameter_encryption_time += duration_cast<nanoseconds>(steady_clock::now() - start);
+
+    if (multiplicative) {
+        ++encrypted_weight_count;
+    } else {
+        ++encrypted_bias_count;
+    }
+
+    return encrypted;
+}
+
+Ctxt FHEController::mult_model_parameter(const Ctxt& c,
+                                         const vector<double>& values,
+                                         int level,
+                                         int plaintext_num_slots) {
+    if (!encrypt_model_parameters) {
+        return context->EvalMult(c, encode(values, level, plaintext_num_slots));
+    }
+
+    Ctxt encrypted_weight = encrypt_model_parameter(values, level, plaintext_num_slots, true);
+    return context->EvalMult(c, encrypted_weight);
+}
+
+Ctxt FHEController::add_model_parameter(const Ctxt& c,
+                                        const vector<double>& values,
+                                        int plaintext_level,
+                                        int plaintext_num_slots) {
+    if (!encrypt_model_parameters) {
+        return context->EvalAdd(c, encode(values, plaintext_level, plaintext_num_slots));
+    }
+
+    Ctxt encrypted_bias = encrypt_model_parameter(values, c->GetLevel(), plaintext_num_slots, false);
+    return context->EvalAdd(c, encrypted_bias);
+}
+
+void FHEController::print_model_parameter_stats() const {
+    cout << "Model parameter mode: "
+         << (encrypt_model_parameters ? "CKKS ciphertext" : "CKKS plaintext") << endl;
+
+    if (!encrypt_model_parameters) {
+        return;
+    }
+
+    const auto milliseconds_spent = duration_cast<milliseconds>(model_parameter_encryption_time).count();
+    cout << "Encrypted multiplicative parameter tensors: " << encrypted_weight_count << endl;
+    cout << "Encrypted additive parameter tensors: " << encrypted_bias_count << endl;
+    cout << "On-demand model parameter encryption time: "
+         << milliseconds_spent / 1000.0 << " seconds" << endl;
+    cout << "Note: this preparation time is included in the timed end-to-end run." << endl;
 }
 
 Ctxt FHEController::bootstrap(const Ctxt &c, bool timing) {
@@ -696,7 +795,7 @@ Ctxt FHEController::convbn_initial(const Ctxt &in, double scale, bool timing) {
     c_rotations.push_back(
             context->EvalRotate(context->EvalFastRotation(in, padding, context->GetCyclotomicOrder(), digits), img_width ));
 
-    Ptxt bias = encode(read_values_from_file("../weights/conv1bn1-bias.bin", scale), in->GetLevel(), 16384);
+    vector<double> bias = read_values_from_file("../weights/conv1bn1-bias.bin", scale);
 
     Ctxt finalsum;
 
@@ -708,8 +807,7 @@ Ctxt FHEController::convbn_initial(const Ctxt &in, double scale, bool timing) {
         for (int k = 0; k < 9; k++) {
             vector<double> values = read_values_from_file("../weights/conv1bn1-ch" +
                                                           to_string(j) + "-k" + to_string(k+1) + ".bin", scale);
-            Ptxt encoded = encode(values, in->GetLevel(), 16384);
-            k_rows.push_back(context->EvalMult(c_rotations[k], encoded));
+            k_rows.push_back(mult_model_parameter(c_rotations[k], values, in->GetLevel(), 16384));
         }
 
         Ctxt sum = context->EvalAddMany(k_rows);
@@ -731,7 +829,7 @@ Ctxt FHEController::convbn_initial(const Ctxt &in, double scale, bool timing) {
 
     }
 
-    finalsum = context->EvalAdd(finalsum, bias);
+    finalsum = add_model_parameter(finalsum, bias, in->GetLevel(), 16384);
 
     if (timing) {
         print_duration(start, "Initial layer");
@@ -767,7 +865,7 @@ Ctxt FHEController::convbn(const Ctxt &in, int layer, int n, double scale, bool 
     c_rotations.push_back(
             context->EvalRotate(context->EvalFastRotation(in, padding, context->GetCyclotomicOrder(), digits), img_width ));
 
-    Ptxt bias = encode(read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias.bin", scale), in->GetLevel(), 16384);
+    vector<double> bias = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias.bin", scale);
 
     Ctxt finalsum;
 
@@ -777,8 +875,7 @@ Ctxt FHEController::convbn(const Ctxt &in, int layer, int n, double scale, bool 
         for (int k = 0; k < 9; k++) {
             vector<double> values = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                                       to_string(j) + "-k" + to_string(k+1) + ".bin", scale);
-            Ptxt encoded = encode(values, in->GetLevel(), 16384);
-            k_rows.push_back(context->EvalMult(c_rotations[k], encoded));
+            k_rows.push_back(mult_model_parameter(c_rotations[k], values, in->GetLevel(), 16384));
         }
 
         Ctxt sum = context->EvalAddMany(k_rows);
@@ -792,7 +889,7 @@ Ctxt FHEController::convbn(const Ctxt &in, int layer, int n, double scale, bool 
 
     }
 
-    finalsum = context->EvalAdd(finalsum, bias);
+    finalsum = add_model_parameter(finalsum, bias, in->GetLevel(), 16384);
 
     if (timing) {
         print_duration(start, "Block " + to_string(layer) + " - convbn" + to_string(n));
@@ -827,7 +924,7 @@ Ctxt FHEController::convbn2(const Ctxt &in, int layer, int n, double scale, bool
     c_rotations.push_back(
             context->EvalRotate(context->EvalFastRotation(in, padding, context->GetCyclotomicOrder(), digits), img_width ));
 
-    Ptxt bias = encode(read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias.bin", scale), circuit_depth-2, 8192);
+    vector<double> bias = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias.bin", scale);
 
     Ctxt finalsum;
 
@@ -837,8 +934,7 @@ Ctxt FHEController::convbn2(const Ctxt &in, int layer, int n, double scale, bool
         for (int k = 0; k < 9; k++) {
             vector<double> values = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                                           to_string(j) + "-k" + to_string(k+1) + ".bin", scale);
-            Ptxt encoded = encode(values, circuit_depth - 2, 8192);
-            k_rows.push_back(context->EvalMult(c_rotations[k], encoded));
+            k_rows.push_back(mult_model_parameter(c_rotations[k], values, circuit_depth - 2, 8192));
         }
 
         Ctxt sum = context->EvalAddMany(k_rows);
@@ -852,7 +948,7 @@ Ctxt FHEController::convbn2(const Ctxt &in, int layer, int n, double scale, bool
 
     }
 
-    finalsum = context->EvalAdd(finalsum, bias);
+    finalsum = add_model_parameter(finalsum, bias, circuit_depth - 2, 8192);
 
     if (timing) {
         print_duration(start, "Block " + to_string(layer) + " - convbn" + to_string(n));
@@ -887,7 +983,7 @@ Ctxt FHEController::convbn3(const Ctxt &in, int layer, int n, double scale, bool
     c_rotations.push_back(
             context->EvalRotate(context->EvalFastRotation(in, padding, context->GetCyclotomicOrder(), digits), img_width ));
 
-    Ptxt bias = encode(read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias.bin", scale), c_rotations[0]->GetLevel(), 4096);
+    vector<double> bias = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias.bin", scale);
 
     Ctxt finalsum;
 
@@ -897,8 +993,7 @@ Ctxt FHEController::convbn3(const Ctxt &in, int layer, int n, double scale, bool
         for (int k = 0; k < 9; k++) {
             vector<double> values = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                                           to_string(j) + "-k" + to_string(k+1) + ".bin", scale);
-            Ptxt encoded = encode(values, c_rotations[0]->GetLevel(), 4096);
-            k_rows.push_back(context->EvalMult(c_rotations[k], encoded));
+            k_rows.push_back(mult_model_parameter(c_rotations[k], values, c_rotations[0]->GetLevel(), 4096));
         }
 
         Ctxt sum = context->EvalAddMany(k_rows);
@@ -912,7 +1007,7 @@ Ctxt FHEController::convbn3(const Ctxt &in, int layer, int n, double scale, bool
 
     }
 
-    finalsum = context->EvalAdd(finalsum, bias);
+    finalsum = add_model_parameter(finalsum, bias, c_rotations[0]->GetLevel(), 4096);
 
     if (timing) {
         print_duration(start, "Block" + to_string(layer) + " - convbn" + to_string(n));
@@ -949,8 +1044,8 @@ vector<Ctxt> FHEController::convbn1632sx(const Ctxt &in, int layer, int n, doubl
     vector<Ctxt> applied_filters32;
 
 
-    Ptxt bias1 = encode(read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias1.bin", scale), in->GetLevel(), 16384);
-    Ptxt bias2 = encode(read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias2.bin", scale), in->GetLevel(), 16384);
+    vector<double> bias1 = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias1.bin", scale);
+    vector<double> bias2 = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias2.bin", scale);
 
     Ctxt finalSum016;
     Ctxt finalSum1632;
@@ -962,11 +1057,11 @@ vector<Ctxt> FHEController::convbn1632sx(const Ctxt &in, int layer, int n, doubl
         for (int k = 0; k < 9; k++) {
             vector<double> values = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                                       to_string(j) + "-k" + to_string(k+1) + ".bin", scale);
-            k_rows016.push_back(context->EvalMult(c_rotations[k], encode(values, in->GetLevel(), 16384)));
+            k_rows016.push_back(mult_model_parameter(c_rotations[k], values, in->GetLevel(), 16384));
 
             values = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                        to_string(j+16) + "-k" + to_string(k+1) + ".bin", scale);
-            k_rows1632.push_back(context->EvalMult(c_rotations[k], encode(values, in->GetLevel(), 16384)));
+            k_rows1632.push_back(mult_model_parameter(c_rotations[k], values, in->GetLevel(), 16384));
         }
 
         Ctxt sum016 = context->EvalAddMany(k_rows016);
@@ -986,8 +1081,8 @@ vector<Ctxt> FHEController::convbn1632sx(const Ctxt &in, int layer, int n, doubl
 
     }
 
-    finalSum016 = context->EvalAdd(finalSum016, bias1);
-    finalSum1632 = context->EvalAdd(finalSum1632, bias2);
+    finalSum016 = add_model_parameter(finalSum016, bias1, in->GetLevel(), 16384);
+    finalSum1632 = add_model_parameter(finalSum1632, bias2, in->GetLevel(), 16384);
 
     if (timing) {
         print_duration(start, "Block " + to_string(layer) + " - convbnSx" + to_string(n));
@@ -1002,8 +1097,8 @@ vector<Ctxt> FHEController::convbn1632dx(const Ctxt &in, int layer, int n, doubl
     vector<Ctxt> applied_filters16;
     vector<Ctxt> applied_filters32;
 
-    Ptxt bias1 = encode(read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-bias1.bin", scale), in->GetLevel(), 16384);
-    Ptxt bias2 = encode(read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-bias2.bin", scale), in->GetLevel(), 16384);
+    vector<double> bias1 = read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-bias1.bin", scale);
+    vector<double> bias2 = read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-bias2.bin", scale);
 
     Ctxt finalSum016;
     Ctxt finalSum1632;
@@ -1014,12 +1109,12 @@ vector<Ctxt> FHEController::convbn1632dx(const Ctxt &in, int layer, int n, doubl
 
         vector<double> values = read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                                       to_string(j) + "-k" + to_string(1) + ".bin", scale);
-        k_rows016.push_back(context->EvalMult(in, encode(values, in->GetLevel(), num_slots)));
+        k_rows016.push_back(mult_model_parameter(in, values, in->GetLevel(), num_slots));
 
         values = read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                        to_string(j+16) + "-k" + to_string(1) + ".bin", scale);
 
-        k_rows1632.push_back(context->EvalMult(in, encode(values, in->GetLevel(), num_slots)));
+        k_rows1632.push_back(mult_model_parameter(in, values, in->GetLevel(), num_slots));
 
         Ctxt sum016 = context->EvalAddMany(k_rows016);
         Ctxt sum1632 = context->EvalAddMany(k_rows1632);
@@ -1038,8 +1133,8 @@ vector<Ctxt> FHEController::convbn1632dx(const Ctxt &in, int layer, int n, doubl
 
     }
 
-    finalSum016 = context->EvalAdd(finalSum016, bias1);
-    finalSum1632 = context->EvalAdd(finalSum1632, bias2);
+    finalSum016 = add_model_parameter(finalSum016, bias1, in->GetLevel(), 16384);
+    finalSum1632 = add_model_parameter(finalSum1632, bias2, in->GetLevel(), 16384);
 
     if (timing) {
         print_duration(start, "Block " + to_string(layer) + " - convbnDx" + to_string(n));
@@ -1076,8 +1171,8 @@ vector<Ctxt> FHEController::convbn3264sx(const Ctxt &in, int layer, int n, doubl
     vector<Ctxt> applied_filters64;
 
 
-    Ptxt bias1 = encode(read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias1.bin", scale), in->GetLevel(), 8192);
-    Ptxt bias2 = encode(read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias2.bin", scale), in->GetLevel(), 8192);
+    vector<double> bias1 = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias1.bin", scale);
+    vector<double> bias2 = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-bias2.bin", scale);
 
     Ctxt finalSum032;
     Ctxt finalSum3264;
@@ -1089,11 +1184,11 @@ vector<Ctxt> FHEController::convbn3264sx(const Ctxt &in, int layer, int n, doubl
         for (int k = 0; k < 9; k++) {
             vector<double> values = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                                           to_string(j) + "-k" + to_string(k+1) + ".bin", scale);
-            k_rows032.push_back(context->EvalMult(c_rotations[k], encode(values, in->GetLevel(), 8192)));
+            k_rows032.push_back(mult_model_parameter(c_rotations[k], values, in->GetLevel(), 8192));
 
             values = read_values_from_file("../weights/layer" + to_string(layer) + "-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                            to_string(j+32) + "-k" + to_string(k+1) + ".bin", scale);
-            k_rows3264.push_back(context->EvalMult(c_rotations[k], encode(values, in->GetLevel(), 8192)));
+            k_rows3264.push_back(mult_model_parameter(c_rotations[k], values, in->GetLevel(), 8192));
         }
 
         Ctxt sum032 = context->EvalAddMany(k_rows032);
@@ -1113,8 +1208,8 @@ vector<Ctxt> FHEController::convbn3264sx(const Ctxt &in, int layer, int n, doubl
 
     }
 
-    finalSum032 = context->EvalAdd(finalSum032, bias1);
-    finalSum3264 = context->EvalAdd(finalSum3264, bias2);
+    finalSum032 = add_model_parameter(finalSum032, bias1, in->GetLevel(), 8192);
+    finalSum3264 = add_model_parameter(finalSum3264, bias2, in->GetLevel(), 8192);
 
     if (timing) {
         print_duration(start, "Block " + to_string(layer) + " - convbnSx" + to_string(n));
@@ -1129,8 +1224,8 @@ vector<Ctxt> FHEController::convbn3264dx(const Ctxt &in, int layer, int n, doubl
     vector<Ctxt> applied_filters32;
     vector<Ctxt> applied_filters64;
 
-    Ptxt bias1 = encode(read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-bias1.bin", scale), in->GetLevel(), 8192);
-    Ptxt bias2 = encode(read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-bias2.bin", scale), in->GetLevel(), 8192);
+    vector<double> bias1 = read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-bias1.bin", scale);
+    vector<double> bias2 = read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-bias2.bin", scale);
 
     Ctxt finalSum032;
     Ctxt finalSum3264;
@@ -1141,12 +1236,12 @@ vector<Ctxt> FHEController::convbn3264dx(const Ctxt &in, int layer, int n, doubl
 
         vector<double> values = read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                                       to_string(j) + "-k" + to_string(1) + ".bin", scale);
-        k_rows032.push_back(context->EvalMult(in, encode(values, in->GetLevel(), 8192)));
+        k_rows032.push_back(mult_model_parameter(in, values, in->GetLevel(), 8192));
 
         values = read_values_from_file("../weights/layer" + to_string(layer) + "dx-conv" + to_string(n) + "bn" + to_string(n) + "-ch" +
                                        to_string(j+32) + "-k" + to_string(1) + ".bin", scale);
 
-        k_rows3264.push_back(context->EvalMult(in, encode(values, in->GetLevel(), 8192)));
+        k_rows3264.push_back(mult_model_parameter(in, values, in->GetLevel(), 8192));
 
         Ctxt sum032 = context->EvalAddMany(k_rows032);
         Ctxt sum3264 = context->EvalAddMany(k_rows3264);
@@ -1165,8 +1260,8 @@ vector<Ctxt> FHEController::convbn3264dx(const Ctxt &in, int layer, int n, doubl
 
     }
 
-    finalSum032 = context->EvalAdd(finalSum032, bias1);
-    finalSum3264 = context->EvalAdd(finalSum3264, bias2);
+    finalSum032 = add_model_parameter(finalSum032, bias1, in->GetLevel(), 8192);
+    finalSum3264 = add_model_parameter(finalSum3264, bias2, in->GetLevel(), 8192);
 
     if (timing) {
         print_duration(start, "Block " + to_string(layer) + " - convbnDx" + to_string(n));

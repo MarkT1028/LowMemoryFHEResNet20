@@ -24,6 +24,39 @@ We propose an approach to convolutions called _Optimized Vector Encoding_, which
 
 Experiments show that it is possible to evaluate the circuit in less than 5 minutes (in [3] it requires more than 6 minutes) and by using a small amount of RAM, from 10GB to 15GB, depending on the desired precision and speed.
 
+## 32x32 encrypted-model-parameter experiment
+
+This branch adds an experimental comparison between the original plaintext model parameters and CKKS-encrypted model parameters. It keeps the original 32x32 CIFAR-10 packing, network, input, and OpenFHE parameter sets unchanged.
+
+The encrypted mode covers all learned parameters used by the standard ResNet20 execution path:
+
+- convolution and batch-normalization fused kernels;
+- convolution and batch-normalization fused biases;
+- final fully connected layer weights.
+
+Packing masks and the fixed residual-path scale factors are circuit constants, not learned model parameters, so they remain plaintext. Model parameter ciphertexts are encrypted on demand and released after use. This avoids keeping thousands of large ciphertexts resident in memory at once. The program reports the number of encrypted multiplicative/additive tensors and the accumulated parameter-encryption time separately; this preparation time is still included in the end-to-end run time.
+
+Encrypted parameters are the default on this branch. Use the same executable for a controlled comparison:
+
+```bash
+# New experiment: ciphertext activations x ciphertext model weights
+./LowMemoryFHEResNet20 load_keys 3 weights encrypted input "inputs/luis.png" verbose 1
+
+# Control: original ciphertext activations x plaintext model weights
+./LowMemoryFHEResNet20 load_keys 3 weights plaintext input "inputs/luis.png" verbose 1
+```
+
+The original `keys_exp3` folder can be reused because it already contains the evaluation-multiplication/relinearization key required for ciphertext-ciphertext multiplication. Run this inexpensive check before the full inference:
+
+```bash
+./LowMemoryFHEResNet20 load_keys 3 test_encrypted_weights verbose 1
+```
+
+The self-test evaluates encrypted input x encrypted weight + encrypted bias and compares the decrypted result with a known vector.
+
+> [!IMPORTANT]
+> This is a single-process performance experiment. The process still reads the original parameter files and encrypts them with the loaded public key immediately before use. The homomorphic operands are genuinely ciphertexts, but this alone is not a complete model-confidential deployment protocol: in such a protocol, a separate model owner would encrypt the parameters offline and the inference server would never receive the plaintext parameter files.
+
 
 
 ## Architecture
@@ -104,6 +137,8 @@ and run it with the following command:
 - `input`, type: `string`, the filename of a custom image. **MUST** be a three channel RGB 32x32 image either in `.jpg` or in `.png` format
 - `verbose` a value in `[-1, 0, 1, 2]`, the first shows no information, the last shows a lot of messages
 - `plain`: added when the user wants the plain result too. Note: enabling this option means that a Python script will be executed after the encrypted inference. This script requires the following modules: `torch`, `torchvision`, `PIL`, `numpy`.
+- `weights`, followed by `encrypted` or `plaintext`. This branch defaults to `encrypted`.
+- `test_encrypted_weights`: run a small ciphertext-weight correctness test instead of the full ResNet20 inference. It must be used together with `load_keys`.
 
 #### Some examples 
 

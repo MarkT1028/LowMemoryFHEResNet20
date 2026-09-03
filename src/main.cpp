@@ -29,6 +29,7 @@ string input_filename;
 int verbose;
 bool test;
 bool plain;
+bool test_encrypted_weights;
 
 /*
  * TODO:
@@ -124,11 +125,20 @@ int main(int argc, char *argv[]) {
         controller.load_context(verbose > 1);
     }
 
+    if (test_encrypted_weights) {
+        exit(controller.test_encrypted_model_parameter_ops() ? 0 : 1);
+    }
+
     executeResNet20();
 }
 
 void executeResNet20() {
     if (verbose >= 0) cout << "Encrypted ResNet20 classification started." << endl;
+    if (verbose >= 0) {
+        cout << "Model parameters are "
+             << (controller.model_parameters_are_encrypted() ? "encrypted CKKS ciphertexts." : "CKKS plaintexts.")
+             << endl;
+    }
 
     Ctxt firstLayer, resLayer1, resLayer2, resLayer3, finalRes;
 
@@ -197,6 +207,7 @@ void executeResNet20() {
     Serial::SerializeToFile("../checkpoints/finalres.bin", finalRes, SerType::BINARY);
 
     if (verbose > 0) print_duration_yellow(start, "The evaluation of the whole circuit took: ");
+    if (verbose >= 0) controller.print_model_parameter_stats();
 }
 
 Ctxt initial_layer(const Ctxt& in) {
@@ -214,14 +225,14 @@ Ctxt final_layer(const Ctxt& in) {
 
     controller.num_slots = 4096;
 
-    Ptxt weight = controller.encode(read_fc_weight("../weights/fc.bin"), in->GetLevel(), controller.num_slots);
+    vector<double> weight = read_fc_weight("../weights/fc.bin");
 
     Ctxt res = controller.rotsum(in, 64);
     res = controller.mult(res, controller.mask_mod(64, res->GetLevel(), 1.0 / 64.0));
 
     //From here, I need 10 repetitons, but I use 16 since *repeat* goes exponentially
     res = controller.repeat(res, 16);
-    res = controller.mult(res, weight);
+    res = controller.mult_model_parameter(res, weight, res->GetLevel(), controller.num_slots);
     res = controller.rotsum_padded(res, 64);
 
     if (verbose >= 0) {
@@ -502,6 +513,10 @@ void check_arguments(int argc, char *argv[]) {
             test = true;
         }
 
+        if (string(argv[i]) == "test_encrypted_weights") {
+            test_encrypted_weights = true;
+        }
+
         if (string(argv[i]) == "generate_keys") {
             if (i + 1 < argc) {
                 string folder = "";
@@ -544,6 +559,24 @@ void check_arguments(int argc, char *argv[]) {
 
         if (string(argv[i]) == "plain") {
             plain = true;
+        }
+
+        if (string(argv[i]) == "weights") {
+            if (i + 1 >= argc) {
+                cerr << "The 'weights' argument requires either 'encrypted' or 'plaintext'." << endl;
+                exit(1);
+            }
+
+            string mode = string(argv[i + 1]);
+            if (mode == "encrypted") {
+                controller.set_encrypt_model_parameters(true);
+            } else if (mode == "plaintext") {
+                controller.set_encrypt_model_parameters(false);
+            } else {
+                cerr << "Unknown weight mode '" << mode
+                     << "'. Use 'weights encrypted' or 'weights plaintext'." << endl;
+                exit(1);
+            }
         }
 
     }
