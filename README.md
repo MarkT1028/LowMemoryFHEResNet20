@@ -99,15 +99,80 @@ and the precision-protection path:
 ```
 
 On the development machine these passed with maximum absolute errors of about
-`7.54e-10` and `6.98e-2`, respectively. Run the horse image with:
+`7.54e-10` and `6.98e-2`, respectively. Run the horse image with encrypted
+model parameters using:
 
 ```bash
 set -o pipefail
 /usr/bin/time -v ./LowMemoryFHEResNet20 \
-  load_keys 3 resolution 256 \
+  load_keys 3 resolution 256 weights encrypted \
   input "inputs/horse_256x256.png" verbose 1 \
-  2>&1 | tee ../logs/infer_exp3_256.log
+  2>&1 | tee ../logs/infer_exp3_256_encrypted_weights.log
 ```
+
+#### Native 256x256 encrypted-model-parameter experiment
+
+Encrypted parameters are the default on this branch. Every compact Conv+BN
+fused diagonal, every fused bias, and each of the four final fully-connected
+weight partitions is encrypted as a CKKS ciphertext before it is used. Packing
+masks, fixed residual scales, refresh factors, and activation coefficients are
+circuit constants rather than learned model parameters, so they remain
+plaintext.
+
+Parameter ciphertexts are created on demand and released after the associated
+operation. This avoids retaining tens of thousands of large `2^17`-ring
+ciphertexts simultaneously. A full 256x256 run performs approximately 47,540
+ciphertext multiplicative parameter operations and 268 encrypted-bias
+additions. It is therefore expected to run for several hours and to be
+substantially slower than the plaintext-weight 256x256 baseline.
+
+The existing `keys_exp3_256` can be reused; its serialized EvalMult key supports
+the ciphertext-ciphertext multiplications. Do not delete or regenerate that key
+directory. Run the inexpensive operation test first:
+
+```bash
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 \
+  test_encrypted_weights verbose 1
+```
+
+Before a complete inference, verify the precision-sensitive final and refresh
+paths with encrypted fully-connected weights:
+
+```bash
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 \
+  weights encrypted probe_final verbose 1
+
+./LowMemoryFHEResNet20 load_keys 3 resolution 256 \
+  weights encrypted probe_refresh verbose 1
+```
+
+On the development machine, the encrypted-parameter operation self-test passed
+with a maximum absolute error of `1.59e-8`. The encrypted-FC final probe passed
+at `9.44e-10`, and the encrypted-FC refresh probe passed at `6.98e-2`, below its
+`1.5e-1` tolerance and without a CKKS decryption failure.
+
+For an A/B comparison, keep the image, key set, executable, and WSL settings
+fixed and change only the parameter mode:
+
+```bash
+set -o pipefail
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 256 weights plaintext \
+  input "inputs/horse_256x256.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_256_plain_weights.log
+
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 256 weights encrypted \
+  input "inputs/horse_256x256.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_256_encrypted_weights.log
+```
+
+> [!IMPORTANT]
+> This branch is a single-process performance experiment. It reads the clear
+> compact `.fwgt` files and encrypts each encoded parameter immediately before
+> use. The homomorphic circuit genuinely receives ciphertext parameters, but a
+> complete model-confidential deployment would encrypt the model offline and
+> would not make the clear weight files available to the inference process.
 
 The 256x256 path saves these independent recovery points:
 
@@ -369,6 +434,8 @@ and run it with the following command:
 - `resume_refresh`: with `resolution 128` or `256`, load the unrefreshed Stage 3 checkpoint and rerun its refresh plus the final layer
 - `resume_relu`: with `resolution 128` or `256`, load the final pre-ReLU checkpoint and rerun the final ReLU, refresh, and final layer
 - `resume_stage3`: with `resolution 128` or `256`, load the Stage 2 checkpoint and rerun Stage 3 plus the final layer
+- `weights`, followed by `encrypted` or `plaintext`; this branch defaults to encrypted model parameters for native high-resolution inference
+- `test_encrypted_weights`: run a small ciphertext-weight multiplication and encrypted-bias addition test instead of full inference; use it with `load_keys`
 
 #### Some examples 
 
