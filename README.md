@@ -91,6 +91,268 @@ The idea is to use $b$, which, without the secret key $s$ would look like a rand
 <img src="imgs/arch4.png" alt="Architecture description 4" width=45%>
 
 
+## Reproduce on another Windows computer (WSL2)
+
+This section is the portable setup guide for every experiment branch in this
+fork. Only one clone is required. Switch branches in that clone, then rebuild.
+The words **plaintext weights** below refer only to model parameters: the input
+image is encrypted in every FHE inference branch.
+
+### 0) Choose the experiment branch
+
+| Resolution | Model-parameter mode | Branch | Key directory |
+|---|---|---|---|
+| 32x32 | original plaintext weights | `main` | `keys_exp3` |
+| 32x32 | CKKS-encrypted weights | `feature/32x32-encrypted-weights` | `keys_exp3` |
+| 64x64 | original plaintext weights | `feature/native-64x64` | `keys_exp3_64` |
+| 64x64 | CKKS-encrypted weights | `feature/64x64-encrypted-weights` | `keys_exp3_64` |
+| 128x128 | original plaintext weights | `feature/native-128x128` | `keys_exp3_128` |
+| 128x128 | CKKS-encrypted weights | `feature/128x128-encrypted-weights` | `keys_exp3_128` |
+| 256x256 | original plaintext weights | `feature/native-256x256` | `keys_exp3_256` |
+| 256x256 | CKKS-encrypted weights | `feature/256x256-encrypted-weights` | `keys_exp3_256` |
+
+The plaintext- and encrypted-weight branches at the same resolution use the
+same OpenFHE context and evaluation keys. Generate that resolution's key set
+only once. Never mix files from different key directories.
+
+### 1) Hardware and free-space planning
+
+This project is CPU-only; CUDA and a discrete GPU are not required. Eight CPU
+cores work, while approximately 16 logical cores are recommended. These are
+practical WSL2 allocations rather than cryptographic minimums:
+
+| Resolution | Recommended WSL RAM | Recommended swap | Measured Experiment 3 key size |
+|---|---:|---:|---:|
+| 32x32 | 16 GiB or more | 8 GiB | about 28 GiB |
+| 64x64 | 18 GiB or more | 8-12 GiB | about 31 GiB |
+| 128x128 | 18-21 GiB or more | 12 GiB | about 30 GiB |
+| 256x256 | 24 GiB preferred | 16 GiB | about 52 GiB |
+
+A 256x256 probe has reached about 20.85 GiB resident memory. A known 32 GiB
+Windows host completed it with 21 GiB assigned to WSL plus 12 GiB swap, but
+that is tight; 48-64 GiB host RAM is preferable for 256x256. Reserve at least
+60 GiB free space for one 32/64/128 key set or 90 GiB for 256x256. Keeping all
+four Experiment 3 key directories requires about 141 GiB before builds, logs,
+and checkpoints, so reserve roughly 200 GiB.
+
+### 2) Install and size WSL2
+
+Run this once in an Administrator PowerShell window if Ubuntu is not installed:
+
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+
+Create or edit `%UserProfile%\.wslconfig` on Windows. For a 32 GiB host with
+16 logical processors, the configuration already validated for this project is:
+
+```ini
+[wsl2]
+memory=21GB
+processors=16
+swap=12GB
+```
+
+Do not assign more processors than the new computer has. After changing the
+file, apply it from PowerShell and reopen Ubuntu:
+
+```powershell
+wsl --shutdown
+```
+
+Inside Ubuntu, confirm the resources and disk space:
+
+```bash
+free -h
+nproc
+df -h
+```
+
+Cloning below the WSL home directory is usually faster than `/mnt/c` or
+`/mnt/e`. If the WSL virtual disk lacks space, a large Windows drive may be used,
+but key loading and checkpoint I/O can be slower.
+
+### 3) Install the compiler and OpenFHE 1.0.4
+
+Run inside Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git libomp-dev pkg-config
+
+mkdir -p "$HOME/src"
+git clone --branch v1.0.4 --depth 1 --recursive \
+  https://github.com/openfheorg/openfhe-development.git \
+  "$HOME/src/openfhe-1.0.4"
+
+cmake -S "$HOME/src/openfhe-1.0.4" \
+  -B "$HOME/src/openfhe-1.0.4/build" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_UNITTESTS=OFF \
+  -DBUILD_EXAMPLES=OFF \
+  -DBUILD_BENCHMARKS=OFF
+
+cmake --build "$HOME/src/openfhe-1.0.4/build" -j "$(nproc)"
+sudo cmake --install "$HOME/src/openfhe-1.0.4/build"
+sudo ldconfig
+```
+
+Use OpenFHE **v1.0.4** for these experiments. Newer releases can change CKKS
+level consumption and may reproduce the `DropLastElement` failure described
+later in this README.
+
+### 4) Clone this fork and build the selected branch
+
+The following example selects the 64x64 plaintext-weight branch. Replace the
+branch name with the exact entry from the table in step 0:
+
+```bash
+cd "$HOME"
+git clone https://github.com/MarkT1028/LowMemoryFHEResNet20.git
+cd LowMemoryFHEResNet20
+git fetch --all --prune
+git switch feature/native-64x64
+git branch --show-current
+
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j "$(nproc)"
+mkdir -p logs
+cd build
+```
+
+After switching to another experiment branch, return to the repository root and
+run the two `cmake` commands again. Deleting the existing build directory is not
+normally necessary.
+
+### 5) Generate the matching Experiment 3 keys
+
+Run exactly one block from the `build` directory. Key generation is required
+once per resolution and can take several minutes. It intentionally stops rather
+than overwriting an existing key directory.
+
+```bash
+# 32x32: main or feature/32x32-encrypted-weights
+set -o pipefail
+/usr/bin/time -v ./LowMemoryFHEResNet20 generate_keys 3 verbose 1 \
+  2>&1 | tee ../logs/keygen_exp3_32.log
+```
+
+```bash
+# 64x64: feature/native-64x64 or feature/64x64-encrypted-weights
+set -o pipefail
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  generate_keys 3 resolution 64 verbose 1 \
+  2>&1 | tee ../logs/keygen_exp3_64.log
+```
+
+```bash
+# 128x128: feature/native-128x128 or feature/128x128-encrypted-weights
+set -o pipefail
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  generate_keys 3 resolution 128 verbose 1 \
+  2>&1 | tee ../logs/keygen_exp3_128.log
+```
+
+```bash
+# 256x256: feature/native-256x256 or feature/256x256-encrypted-weights
+set -o pipefail
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  generate_keys 3 resolution 256 verbose 1 \
+  2>&1 | tee ../logs/keygen_exp3_256.log
+```
+
+A successful command ends with `Exit status: 0` and creates the key directory
+shown in step 0. Key directories are ignored by Git and contain a secret key;
+do not commit or upload them. When moving keys to another computer, copy the
+entire directory as one unit and protect `secret-key.txt`.
+
+### 6) Run the matching inference
+
+Enable pipeline failure reporting once, then run the command that corresponds
+to the currently checked-out branch:
+
+```bash
+set -o pipefail
+```
+
+```bash
+# main: 32x32, original plaintext model weights
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 input "inputs/luis.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_32_plain_weights.log
+```
+
+```bash
+# feature/32x32-encrypted-weights
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 weights encrypted input "inputs/luis.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_32_encrypted_weights.log
+```
+
+```bash
+# feature/native-64x64
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 64 input "inputs/cat_64x64.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_64_plain_weights.log
+```
+
+```bash
+# feature/64x64-encrypted-weights
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 64 weights encrypted \
+  input "inputs/cat_64x64.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_64_encrypted_weights.log
+```
+
+```bash
+# feature/native-128x128
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 128 input "inputs/dog_128x128.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_128_plain_weights.log
+```
+
+```bash
+# feature/128x128-encrypted-weights
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 128 weights encrypted \
+  input "inputs/dog_128x128.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_128_encrypted_weights.log
+```
+
+```bash
+# feature/native-256x256
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 256 input "inputs/horse_256x256.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_256_plain_weights.log
+```
+
+```bash
+# feature/256x256-encrypted-weights
+/usr/bin/time -v ./LowMemoryFHEResNet20 \
+  load_keys 3 resolution 256 weights encrypted \
+  input "inputs/horse_256x256.png" verbose 1 \
+  2>&1 | tee ../logs/infer_exp3_256_encrypted_weights.log
+```
+
+Always use an image whose dimensions exactly match the selected resolution.
+Success means the program prints ten output values, a predicted class and index,
+then `/usr/bin/time` reports `Exit status: 0`. With `set -o pipefail`, a failure
+inside the program is not hidden by `tee`. The 128x128 encrypted-weight run has
+taken about two hours on the development machine; 256x256 runs can take several
+hours. Keep the terminal and computer awake.
+
+For encrypted-weight branches, a quick operation check is available after key
+generation:
+
+```bash
+./LowMemoryFHEResNet20 load_keys 3 resolution 64 \
+  test_encrypted_weights verbose 1
+```
+
+Change `64` to `128` or `256` on those branches. On the 32x32 encrypted-weight
+branch, omit `resolution 64`. The test must print
+`Encrypted model-parameter self-test: PASS` before a long inference is started.
+
 ## How to run
 
 > [!IMPORTANT]
